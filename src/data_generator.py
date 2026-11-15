@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import math
 import random
 import sys
@@ -64,6 +65,25 @@ DEFAULT_DAYS = 60
 DEFAULT_SEED = 20261012
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUT_DIR = PROJECT_ROOT / "data" / "raw"
+
+#: Replenishment policies the simulator can run.
+#:   heuristic -- the legacy rule: a static order-up-to level built from the
+#:                catalog base demand, blind to the weekday pattern.
+#:   level     -- statistical base-stock with the correct cover (days to the
+#:                next delivery) and safety stock, but NO weekday seasonality:
+#:                demand is the flat mean of the last 14 days.
+#:   forecast  -- the same base-stock, with demand taken from a seasonal
+#:                (same-weekday) forecast.
+#: `level` exists to isolate the value of FORECASTING from the value of merely
+#: sizing orders properly: forecast vs level is the clean comparison.
+#: Both learn ONLY from the sales history the simulation already produced.
+POLICIES = ("heuristic", "level", "forecast")
+
+#: Cycle service level targeted by the forecast policy (z for ~90%).
+FORECAST_SERVICE_Z = 1.28
+#: The forecast policy still keeps a shelf-presentation minimum, as a real
+#: store would: this fraction of the SKU's configured min_safety_stock.
+PRESENTATION_MIN_FRACTION = 0.25
 
 #: ISO weekday numbers (Mon=1 ... Sun=7) considered weekend in retail terms.
 WEEKEND_ISO_DAYS = (5, 6, 7)  # Friday, Saturday, Sunday
@@ -337,6 +357,9 @@ class SimulationResult:
     stockout_events: int = 0
     lost_revenue: float = 0.0
     anomalies_injected: Dict[str, int] = field(default_factory=dict)
+    #: One entry per injected defect, with the natural key of the offending
+    #: row. This is the ground truth the ETL quality gate is scored against.
+    anomaly_log: List[Dict[str, str]] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -425,11 +448,24 @@ class RetailSimulator:
     """Runs the day-by-day store operations simulation."""
 
     def __init__(self, start_date: date, end_date: date, seed: int,
-                 inject_anomalies: bool) -> None:
+                 inject_anomalies: bool, policy: str = "heuristic",
+                 service_z: float = FORECAST_SERVICE_Z) -> None:
+        if policy not in POLICIES:
+            raise ValueError(f"policy must be one of {POLICIES}, got {policy!r}")
         self.start_date = start_date
         self.end_date = end_date
         self.rng = random.Random(seed)
         self.inject_anomalies = inject_anomalies
+        self.policy = policy
+        self.service_z = service_z
+        #: (store_code, sku_code) -> days the shelf ran empty. A POS knows when
+        #: a SKU sold out, and on those days units sold UNDERSTATE demand
+        #: (censoring), so the estimators below leave them out.
+        self._censored: Dict[Tuple[str, str], set] = {}
+        #: (store_code, sku_code) -> {date: units actually sold}. This is what
+        #: a POS can observe, so it is CENSORED by stockouts: it is the only
+        #: history the forecast policy is allowed to learn from.
+        self._sales_hist: Dict[Tuple[str, str], Dict[date, float]] = {}
 
         self.result = SimulationResult()
         #: (store_code, sku_code) -> list of batches, kept FEFO-sorted.
@@ -459,6 +495,10 @@ class RetailSimulator:
     def _next_waste_code(self, day: date) -> str:
         self._waste_seq += 1
         return f"WASTE-{day.year}-{self._waste_seq:05d}"
+
+    def _log_anomaly(self, kind: str, dataset: str, **key: str) -> None:
+        """Record the natural key of an injected defect (ground truth)."""
+        self.result.anomaly_log.append({"kind": kind, "dataset": dataset, **key})
 
     def _spend_anomaly(self, kind: str) -> bool:
         """Consume one unit of an anomaly budget; False once exhausted."""
@@ -521,6 +561,117 @@ class RetailSimulator:
         cover_days = product.delivery_interval_days + 1
         return expected_daily * cover_days + product.min_safety_stock
 
+    # -- demand estimation for the level / forecast policies ----------------
+
+    def _usable_history(self, store: Store, product: Product,
+                        today: date) -> Dict[date, float]:
+        """Observed daily sales before ``today``, corrected for stockout censoring.
+
+        On a day the shelf ran empty, units sold are only a LOWER BOUND on
+        demand. Taking them at face value makes the policy under-order, which
+        causes more stockouts, which depresses the next estimate: a spiral.
+
+        Simply DROPPING those days is the tempting fix and it is wrong: the
+        days removed are exactly the high-demand ones, so the estimate becomes
+        biased low by selection on the outcome. Instead each censored day is
+        floored at the mean of the uncensored days in the window,
+        ``max(observed, mean_uncensored)``, which keeps the observation as the
+        lower bound it is without pretending it is the demand.
+        """
+        key = (store.store_code, product.sku_code)
+        hist = self._sales_hist.get(key, {})
+        censored = self._censored.get(key, set())
+        window = {d: v for d, v in hist.items() if d < today}
+        clean = [v for d, v in window.items() if d not in censored]
+        if not clean or not censored:
+            return window
+        floor = sum(clean) / len(clean)
+        return {d: (max(v, floor) if d in censored else v)
+                for d, v in window.items()}
+
+    def _expected_demand(self, store: Store, product: Product,
+                         target_day: date, today: date,
+                         seasonal: bool = True) -> float:
+        """Expected units for ``target_day`` using only history before ``today``.
+
+        Seasonal: mean of the same weekday over the last four weeks, falling
+        back to the 14-day mean, then to the catalog base rate on a cold start.
+        Flat (``seasonal=False``): the 14-day mean, ignoring the weekday.
+        """
+        hist = self._usable_history(store, product, today)
+        if seasonal:
+            same_weekday = [hist[target_day - timedelta(days=7 * w)]
+                            for w in range(1, 5)
+                            if (target_day - timedelta(days=7 * w)) in hist]
+            if same_weekday:
+                return sum(same_weekday) / len(same_weekday)
+
+        recent = [hist[today - timedelta(days=k)] for k in range(1, 15)
+                  if (today - timedelta(days=k)) in hist]
+        if recent:
+            return sum(recent) / len(recent)
+        return product.base_daily_demand * store.traffic_index
+
+    def _residual_sigma(self, store: Store, product: Product, today: date,
+                        fallback_level: float, seasonal: bool = True) -> float:
+        """Std-dev of one-step forecast errors over the last 14 days.
+
+        Seasonal: each past day is predicted with the same method used going
+        forward (mean of the same weekday one and two weeks earlier). Flat:
+        the raw spread around the 14-day mean, so the weekday swing it cannot
+        model rightly inflates its safety stock. With too little history it
+        falls back to a coefficient of variation of 0.30.
+        """
+        hist = self._usable_history(store, product, today)
+        if not seasonal:
+            flat = [hist[today - timedelta(days=k)] for k in range(1, 15)
+                    if (today - timedelta(days=k)) in hist]
+            if len(flat) >= 4:
+                mu = sum(flat) / len(flat)
+                var = sum((v - mu) ** 2 for v in flat) / (len(flat) - 1)
+                return max(1.0, math.sqrt(var))
+            return max(1.0, 0.30 * fallback_level)
+
+        errors = []
+        for k in range(1, 15):
+            day = today - timedelta(days=k)
+            if day not in hist:
+                continue
+            priors = [hist[day - timedelta(days=7 * w)] for w in (1, 2)
+                      if (day - timedelta(days=7 * w)) in hist]
+            if priors:
+                errors.append(hist[day] - sum(priors) / len(priors))
+        if len(errors) >= 4:
+            mean_error = sum(errors) / len(errors)
+            variance = sum((e - mean_error) ** 2 for e in errors) / (len(errors) - 1)
+            return max(1.0, math.sqrt(variance))
+        return max(1.0, 0.30 * fallback_level)
+
+    def _forecast_order_up_to(self, product: Product, store: Store,
+                              day: date) -> float:
+        """Order-up-to level = expected demand over the cover + safety stock.
+
+        The cover is the delivery cycle (``interval`` selling days), capped at
+        the shelf life: it is pointless to stock more than can be sold before
+        the lot expires. This is a periodic-review base-stock level: stock must
+        last from this delivery until the next one, because the next lot
+        arrives in the morning of ``day + interval``. (The legacy heuristic
+        uses interval + 1, a second day of cover that is pure waste risk on a
+        two-day shelf life.)
+        """
+        seasonal = self.policy == "forecast"
+        cover_days = product.delivery_interval_days
+        horizon = max(1, min(cover_days, product.shelf_life_days))
+        daily = [self._expected_demand(store, product, day + timedelta(days=j),
+                                       day, seasonal=seasonal)
+                 for j in range(horizon)]
+        expected = sum(daily)
+        sigma = self._residual_sigma(store, product, day, expected / horizon,
+                                     seasonal=seasonal)
+        safety = self.service_z * sigma * math.sqrt(horizon)
+        presentation_min = PRESENTATION_MIN_FRACTION * product.min_safety_stock
+        return expected + max(safety, presentation_min)
+
     # -- inbound logistics --------------------------------------------------
 
     def _receive_deliveries(self, day: date, temperature: float) -> None:
@@ -540,11 +691,16 @@ class RetailSimulator:
                     continue
 
                 on_hand = self._on_hand(store.store_code, product.sku_code, day)
-                target = self._target_stock(product, store)
-                if on_hand >= target * 0.92:
-                    continue  # no need to order yet
-
-                order_qty = max(1.0, round(target - on_hand))
+                if self.policy in ("level", "forecast"):
+                    target = self._forecast_order_up_to(product, store, day)
+                    order_qty = float(round(target - on_hand))
+                    if order_qty < 1:
+                        continue  # already covered
+                else:
+                    target = self._target_stock(product, store)
+                    if on_hand >= target * 0.92:
+                        continue  # no need to order yet
+                    order_qty = max(1.0, round(target - on_hand))
                 orders.setdefault(product.supplier_code, []).append((product, order_qty))
 
             for supplier_code, lines in orders.items():
@@ -573,6 +729,8 @@ class RetailSimulator:
             qty_dispatched = order_qty
             qty_accepted = order_qty
             line_note = ""
+            hidden_gap = False
+            negative_qty = False
 
             # -- Supplier fill-rate reality: short or damaged deliveries -----
             roll = self.rng.random()
@@ -587,13 +745,18 @@ class RetailSimulator:
                 # documented rejection -> hidden supplier shrinkage.
                 missing = max(1.0, round(qty_dispatched * self.rng.uniform(0.05, 0.12)))
                 qty_accepted = max(0.0, qty_dispatched - missing)
-                line_note = "Descuadre no documentado entre guía de remisión y conteo físico"
+                # Deliberately NO note: an undocumented shortage is, by
+                # definition, one nobody wrote a reason for. Labelling it in
+                # the text would hand the quality gate the answer.
+                line_note = ""
+                hidden_gap = True
                 header_status = "DISCREPANT"
 
             # -- ANOMALY: negative quantity typed at the terminal ------------
             if self.rng.random() < 0.004 and self._spend_anomaly("negative_received_qty"):
                 qty_accepted = -abs(qty_accepted) if qty_accepted else -1.0
                 line_note = "Cantidad capturada con signo invertido en el terminal"
+                negative_qty = True
 
             # Cold-chain reading: refrigerated/hot-holding goods are measured.
             storage = CATEGORIES_BY_CODE[product.category_code].storage_temp_type
@@ -625,6 +788,12 @@ class RetailSimulator:
                 temperature_celsius=reading,
                 notes=line_note,
             ))
+            if hidden_gap:
+                self._log_anomaly("guide_vs_count_discrepancy", "goods_receipts",
+                                  grn_number=grn_number, sku_code=product.sku_code)
+            if negative_qty:
+                self._log_anomaly("negative_received_qty", "goods_receipts",
+                                  grn_number=grn_number, sku_code=product.sku_code)
 
             # Only physically accepted goods become sellable stock.
             if qty_accepted > 0:
@@ -647,8 +816,10 @@ class RetailSimulator:
         expiration = manufacturing + timedelta(days=product.shelf_life_days)
 
         # -- ANOMALY: expiry printed before the manufacturing date -----------
+        bad_expiry = False
         if self.rng.random() < 0.003 and self._spend_anomaly("expiry_before_manufacturing"):
             expiration = manufacturing - timedelta(days=self.rng.randint(1, 5))
+            bad_expiry = True
 
         batch = Batch(
             batch_code=self._next_batch_code(product.sku_code, day),
@@ -662,6 +833,9 @@ class RetailSimulator:
             unit_cost=unit_cost,
         )
         self.stock.setdefault((store.store_code, product.sku_code), []).append(batch)
+        if bad_expiry:
+            self._log_anomaly("expiry_before_manufacturing", "batches",
+                              batch_code=batch.batch_code)
 
     # -- stock helpers ------------------------------------------------------
 
@@ -686,7 +860,10 @@ class RetailSimulator:
         for store in STORES:
             for product in PRODUCTS:
                 demanded = demand_for(product, store, day, temperature, self.rng)
+                hist = self._sales_hist.setdefault(
+                    (store.store_code, product.sku_code), {})
                 if demanded <= 0:
+                    hist[day] = 0.0
                     continue
 
                 remaining = float(demanded)
@@ -705,7 +882,12 @@ class RetailSimulator:
                     units_served += taken
                     cogs += taken * batch.unit_cost
 
+                # What the POS saw: units actually served, never the demand.
+                hist[day] = units_served
+
                 if remaining > 0:
+                    self._censored.setdefault(
+                        (store.store_code, product.sku_code), set()).add(day)
                     # Unserved demand is lost revenue, not a negative stock.
                     self.result.stockout_events += 1
                     self.result.stockout_units += remaining
@@ -793,11 +975,13 @@ class RetailSimulator:
 
         # Losses above the S/ 50 materiality threshold need a named authorizer
         # (enforced in the database by trg_audit_high_waste_alert).
+        unauthorized = False
         if loss_amount > 50.0:
             authorizer = STORE_AUTHORIZERS[store.store_code]
             # -- ANOMALY: material loss posted without authorization ---------
             if self.rng.random() < 0.08 and self._spend_anomaly("unauthorized_high_waste"):
                 authorizer = ""
+                unauthorized = True
         else:
             authorizer = (STORE_AUTHORIZERS[store.store_code]
                           if self.rng.random() < 0.6 else "")
@@ -805,8 +989,12 @@ class RetailSimulator:
         logged_at = datetime.combine(day, datetime.min.time()) + timedelta(
             hours=self.rng.randint(20, 23), minutes=self.rng.randint(0, 59))
 
+        waste_code = self._next_waste_code(day)
+        if unauthorized:
+            self._log_anomaly("unauthorized_high_waste", "waste_log",
+                              waste_code=waste_code)
         self.result.waste.append(WasteEvent(
-            waste_code=self._next_waste_code(day),
+            waste_code=waste_code,
             store_code=store.store_code,
             sku_code=product.sku_code,
             batch_code=batch.batch_code,
@@ -926,6 +1114,34 @@ def export_datasets(result: SimulationResult, out_dir: Path) -> Dict[str, int]:
     return counts
 
 
+def write_manifest(result: SimulationResult, counts: Dict[str, int],
+                   out_dir: Path, *, seed: int, start_date: date,
+                   end_date: date, policy: str, inject_anomalies: bool) -> Path:
+    """Write ``_manifest.json``: how the dataset was made and what is wrong in it.
+
+    The manifest is the ground truth for scoring the ETL quality gate: it lists
+    the natural key of every defect the generator injected, so detection can be
+    measured as recall and precision instead of asserted. It deliberately has no
+    timestamp, so identical inputs yield a byte-identical manifest.
+    """
+    manifest = {
+        "generator": "src/data_generator.py",
+        "seed": seed,
+        "policy": policy,
+        "inject_anomalies": inject_anomalies,
+        "start_date": start_date.isoformat(),
+        "end_date": end_date.isoformat(),
+        "days": (end_date - start_date).days + 1,
+        "row_counts": dict(sorted(counts.items())),
+        "anomaly_counts": dict(sorted(result.anomalies_injected.items())),
+        "anomalies": result.anomaly_log,
+    }
+    path = out_dir / "_manifest.json"
+    path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n",
+                    encoding="utf-8")
+    return path
+
+
 # ---------------------------------------------------------------------------
 # Reporting
 # ---------------------------------------------------------------------------
@@ -990,6 +1206,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                         help="Output directory for the CSV datasets.")
     parser.add_argument("--end-date", type=str, default=None,
                         help="Last simulated day as YYYY-MM-DD (default: yesterday).")
+    parser.add_argument("--policy", choices=POLICIES, default="heuristic",
+                        help="Replenishment policy: the legacy static heuristic, or a "
+                             "forecast-driven order-up-to level (default: heuristic).")
     parser.add_argument("--no-inject-anomalies", dest="inject_anomalies",
                         action="store_false",
                         help="Generate a pristine dataset with no seeded data-quality defects.")
@@ -1015,9 +1234,13 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     start_date = end_date - timedelta(days=args.days - 1)
 
-    simulator = RetailSimulator(start_date, end_date, args.seed, args.inject_anomalies)
+    simulator = RetailSimulator(start_date, end_date, args.seed,
+                                args.inject_anomalies, policy=args.policy)
     result = simulator.run()
     counts = export_datasets(result, args.out)
+    write_manifest(result, counts, args.out, seed=args.seed,
+                   start_date=start_date, end_date=end_date,
+                   policy=args.policy, inject_anomalies=args.inject_anomalies)
     print_summary(result, counts, start_date, end_date, args.out)
     return 0
 
