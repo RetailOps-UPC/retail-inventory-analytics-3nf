@@ -4,8 +4,10 @@
 -- Engine: PostgreSQL 15+
 -- ============================================================================
 -- 19 assertions proving the behaviour the business depends on, without mutating real data:
--- every test runs inside a SAVEPOINT that is rolled back, so the suite is
--- idempotent and safe to run against a populated database.
+-- the whole suite runs in ONE transaction that ends in ROLLBACK, so it is
+-- idempotent and safe to run against a populated database. Tests are kept
+-- independent by rebuilding the fixture before each one (see
+-- pg_temp.reset_fixture), not by savepoints.
 --
 -- Run with:   make test
 --             .\scripts\run_project.ps1 test
@@ -57,29 +59,52 @@ $$;
 -- ----------------------------------------------------------------------------
 -- Fixture: an isolated store, product and three batches with known expiries.
 -- Codes are prefixed TEST- so they can never collide with operational data.
+--
+-- pg_temp.reset_fixture() is called at the start of EVERY test. It deletes
+-- whatever the previous test left behind for the fixture store and recreates
+-- the three batches, so tests are independent of each other without needing a
+-- SAVEPOINT. (A ROLLBACK TO SAVEPOINT would also roll back the assertion
+-- ledger rows, which is exactly the bug this design avoids.)
 -- ----------------------------------------------------------------------------
-DO $$
+CREATE OR REPLACE FUNCTION pg_temp.reset_fixture() RETURNS VOID
+LANGUAGE plpgsql
+AS $$
 DECLARE
     v_store_id    INTEGER;
     v_category_id INTEGER;
     v_product_id  INTEGER;
 BEGIN
-    INSERT INTO stores (store_code, store_name, store_format, district,
-                        city, square_meters)
-    VALUES ('TEST-STORE', 'Fixture Store', 'CONVENIENCE', 'Test District',
-            'Lima', 50.00)
-    RETURNING store_id INTO v_store_id;
+    SELECT store_id INTO v_store_id FROM stores WHERE store_code = 'TEST-STORE';
+    IF v_store_id IS NULL THEN
+        INSERT INTO stores (store_code, store_name, store_format, district,
+                            city, square_meters)
+        VALUES ('TEST-STORE', 'Fixture Store', 'CONVENIENCE', 'Test District',
+                'Lima', 50.00)
+        RETURNING store_id INTO v_store_id;
+    END IF;
 
-    INSERT INTO product_categories (category_code, category_name, storage_temp_type)
-    VALUES ('TEST-CAT', 'Fixture Category', 'AMBIENT')
-    RETURNING category_id INTO v_category_id;
+    SELECT category_id INTO v_category_id
+      FROM product_categories WHERE category_code = 'TEST-CAT';
+    IF v_category_id IS NULL THEN
+        INSERT INTO product_categories (category_code, category_name, storage_temp_type)
+        VALUES ('TEST-CAT', 'Fixture Category', 'AMBIENT')
+        RETURNING category_id INTO v_category_id;
+    END IF;
 
-    INSERT INTO products (sku_code, product_name, category_id, unit_cost,
-                          retail_price, shelf_life_days, is_perishable,
-                          min_safety_stock, reorder_point)
-    VALUES ('TEST-SKU', 'Fixture Product', v_category_id, 10.0000, 25.00,
-            30, TRUE, 5, 10)
-    RETURNING product_id INTO v_product_id;
+    SELECT product_id INTO v_product_id FROM products WHERE sku_code = 'TEST-SKU';
+    IF v_product_id IS NULL THEN
+        INSERT INTO products (sku_code, product_name, category_id, unit_cost,
+                              retail_price, shelf_life_days, is_perishable,
+                              min_safety_stock, reorder_point)
+        VALUES ('TEST-SKU', 'Fixture Product', v_category_id, 10.0000, 25.00,
+                30, TRUE, 5, 10)
+        RETURNING product_id INTO v_product_id;
+    END IF;
+
+    -- Children first, parents last (waste_log -> inventory_batches).
+    DELETE FROM waste_log         WHERE store_id = v_store_id;
+    DELETE FROM daily_sales       WHERE store_id = v_store_id;
+    DELETE FROM inventory_batches WHERE store_id = v_store_id;
 
     -- Three lots, deliberately inserted in NON-expiry order so the procedure
     -- has to sort them itself rather than relying on insertion sequence.
@@ -97,13 +122,17 @@ BEGIN
 END;
 $$;
 
+-- Build the fixture once up front. Each test's DECLARE section resolves the
+-- fixture store and product by code BEFORE its first statement runs, so those
+-- rows must already exist when the first test starts.
+DO $$ BEGIN PERFORM pg_temp.reset_fixture(); END; $$;
+
 
 -- ============================================================================
 -- TEST GROUP 1 -- FEFO ROTATION ORDER
 -- ============================================================================
 
 -- T1.1: a sale smaller than the nearest-expiry lot must consume ONLY that lot.
-SAVEPOINT t1_1;
 DO $$
 DECLARE
     v_store_id   INTEGER := (SELECT store_id   FROM stores   WHERE store_code = 'TEST-STORE');
@@ -112,6 +141,7 @@ DECLARE
     v_middle     NUMERIC;
     v_late       NUMERIC;
 BEGIN
+    PERFORM pg_temp.reset_fixture();
     CALL sp_process_fefo_sale(v_store_id, v_product_id, 4, CURRENT_DATE,
                               'test.runner', FALSE);
 
@@ -126,11 +156,9 @@ BEGIN
                v_soon, v_middle, v_late));
 END;
 $$;
-ROLLBACK TO SAVEPOINT t1_1;
 
 -- T1.2: a sale spanning several lots must cascade strictly by expiry, and a
 --       lot drained to zero must flip to DEPLETED automatically.
-SAVEPOINT t1_2;
 DO $$
 DECLARE
     v_store_id   INTEGER := (SELECT store_id   FROM stores   WHERE store_code = 'TEST-STORE');
@@ -139,6 +167,7 @@ DECLARE
     v_middle     RECORD;
     v_late       RECORD;
 BEGIN
+    PERFORM pg_temp.reset_fixture();
     -- 25 units = all 10 of SOON (+2d) then 15 of MIDDLE (+10d); LATE untouched.
     CALL sp_process_fefo_sale(v_store_id, v_product_id, 25, CURRENT_DATE,
                               'test.runner', FALSE);
@@ -164,16 +193,15 @@ BEGIN
                v_soon.batch_status, v_middle.batch_status));
 END;
 $$;
-ROLLBACK TO SAVEPOINT t1_2;
 
 -- T1.3: an expired lot must never be sold, even while flagged ACTIVE.
-SAVEPOINT t1_3;
 DO $$
 DECLARE
     v_store_id   INTEGER := (SELECT store_id   FROM stores   WHERE store_code = 'TEST-STORE');
     v_product_id INTEGER := (SELECT product_id FROM products WHERE sku_code   = 'TEST-SKU');
     v_expired    NUMERIC;
 BEGIN
+    PERFORM pg_temp.reset_fixture();
     INSERT INTO inventory_batches (batch_code, store_id, product_id,
                                    initial_qty, current_qty,
                                    manufacturing_date, expiration_date,
@@ -193,7 +221,6 @@ BEGIN
         FORMAT('expired lot qty=%s (expected 50, i.e. untouched)', v_expired));
 END;
 $$;
-ROLLBACK TO SAVEPOINT t1_3;
 
 
 -- ============================================================================
@@ -201,7 +228,6 @@ ROLLBACK TO SAVEPOINT t1_3;
 -- ============================================================================
 
 -- T2.1: demand above available stock must raise P0002 and change nothing.
-SAVEPOINT t2_1;
 DO $$
 DECLARE
     v_store_id   INTEGER := (SELECT store_id   FROM stores   WHERE store_code = 'TEST-STORE');
@@ -210,6 +236,7 @@ DECLARE
     v_message    TEXT;
     v_total      NUMERIC;
 BEGIN
+    PERFORM pg_temp.reset_fixture();
     BEGIN
         -- Total sellable stock in the fixture is 130 units.
         CALL sp_process_fefo_sale(v_store_id, v_product_id, 5000, CURRENT_DATE,
@@ -241,16 +268,15 @@ BEGIN
         FORMAT('total stock=%s (expected 130)', v_total));
 END;
 $$;
-ROLLBACK TO SAVEPOINT t2_1;
 
 -- T2.2: a non-positive quantity is rejected as invalid input.
-SAVEPOINT t2_2;
 DO $$
 DECLARE
     v_store_id   INTEGER := (SELECT store_id   FROM stores   WHERE store_code = 'TEST-STORE');
     v_product_id INTEGER := (SELECT product_id FROM products WHERE sku_code   = 'TEST-SKU');
     v_raised     BOOLEAN := FALSE;
 BEGIN
+    PERFORM pg_temp.reset_fixture();
     BEGIN
         CALL sp_process_fefo_sale(v_store_id, v_product_id, -10, CURRENT_DATE,
                                   'test.runner', FALSE);
@@ -263,16 +289,15 @@ BEGIN
         'the procedure accepted a negative quantity');
 END;
 $$;
-ROLLBACK TO SAVEPOINT t2_2;
 
 -- T2.3: the sale is posted to daily_sales with true lot-level COGS.
-SAVEPOINT t2_3;
 DO $$
 DECLARE
     v_store_id   INTEGER := (SELECT store_id   FROM stores   WHERE store_code = 'TEST-STORE');
     v_product_id INTEGER := (SELECT product_id FROM products WHERE sku_code   = 'TEST-SKU');
     v_sale       RECORD;
 BEGIN
+    PERFORM pg_temp.reset_fixture();
     CALL sp_process_fefo_sale(v_store_id, v_product_id, 8, CURRENT_DATE,
                               'test.runner', TRUE);
 
@@ -290,7 +315,6 @@ BEGIN
                v_sale.units_sold, v_sale.gross_revenue, v_sale.cost_of_goods_sold));
 END;
 $$;
-ROLLBACK TO SAVEPOINT t2_3;
 
 
 -- ============================================================================
@@ -298,7 +322,6 @@ ROLLBACK TO SAVEPOINT t2_3;
 -- ============================================================================
 
 -- T3.1: a material loss with no authorizer must be blocked (P0004).
-SAVEPOINT t3_1;
 DO $$
 DECLARE
     v_store_id   INTEGER := (SELECT store_id   FROM stores   WHERE store_code = 'TEST-STORE');
@@ -308,6 +331,7 @@ DECLARE
     v_raised     BOOLEAN := FALSE;
     v_message    TEXT;
 BEGIN
+    PERFORM pg_temp.reset_fixture();
     BEGIN
         -- 10 units x S/ 10.00 = S/ 100.00, well above the S/ 50.00 threshold.
         INSERT INTO waste_log (waste_code, store_id, product_id, waste_reason_id,
@@ -329,10 +353,8 @@ BEGIN
         FORMAT('message was: %s', COALESCE(v_message, '(none)')));
 END;
 $$;
-ROLLBACK TO SAVEPOINT t3_1;
 
 -- T3.2: the same loss WITH a named authorizer must be accepted.
-SAVEPOINT t3_2;
 DO $$
 DECLARE
     v_store_id   INTEGER := (SELECT store_id   FROM stores   WHERE store_code = 'TEST-STORE');
@@ -341,6 +363,7 @@ DECLARE
                               WHERE loss_classification = 'EXPIRATION' LIMIT 1);
     v_amount     NUMERIC;
 BEGIN
+    PERFORM pg_temp.reset_fixture();
     INSERT INTO waste_log (waste_code, store_id, product_id, waste_reason_id,
                            qty_discarded, unit_cost_at_loss, logged_by_user,
                            authorized_by)
@@ -356,10 +379,8 @@ BEGIN
         FORMAT('total_loss_amount=%s (expected 100.00)', v_amount));
 END;
 $$;
-ROLLBACK TO SAVEPOINT t3_2;
 
 -- T3.3: a small loss needs no authorizer (the threshold really is a threshold).
-SAVEPOINT t3_3;
 DO $$
 DECLARE
     v_store_id   INTEGER := (SELECT store_id   FROM stores   WHERE store_code = 'TEST-STORE');
@@ -368,6 +389,7 @@ DECLARE
                               WHERE loss_classification = 'DAMAGE' LIMIT 1);
     v_count      INTEGER;
 BEGIN
+    PERFORM pg_temp.reset_fixture();
     -- 2 units x S/ 10.00 = S/ 20.00, below the threshold.
     INSERT INTO waste_log (waste_code, store_id, product_id, waste_reason_id,
                            qty_discarded, unit_cost_at_loss, logged_by_user)
@@ -382,10 +404,8 @@ BEGIN
         v_count = 1, FORMAT('rows inserted=%s (expected 1)', v_count));
 END;
 $$;
-ROLLBACK TO SAVEPOINT t3_3;
 
 -- T3.4: segregation of duties -- self-authorization must be blocked.
-SAVEPOINT t3_4;
 DO $$
 DECLARE
     v_store_id   INTEGER := (SELECT store_id   FROM stores   WHERE store_code = 'TEST-STORE');
@@ -394,6 +414,7 @@ DECLARE
                               WHERE loss_classification = 'THEFT_SHRINKAGE' LIMIT 1);
     v_raised     BOOLEAN := FALSE;
 BEGIN
+    PERFORM pg_temp.reset_fixture();
     BEGIN
         INSERT INTO waste_log (waste_code, store_id, product_id, waste_reason_id,
                                qty_discarded, unit_cost_at_loss, logged_by_user,
@@ -409,7 +430,6 @@ BEGIN
         v_raised, 'the operator was allowed to authorize their own write-off');
 END;
 $$;
-ROLLBACK TO SAVEPOINT t3_4;
 
 
 -- ============================================================================
@@ -417,7 +437,6 @@ ROLLBACK TO SAVEPOINT t3_4;
 -- ============================================================================
 
 -- T4.1: the nightly sweep flags overdue lots and writes the residual stock off.
-SAVEPOINT t4_1;
 DO $$
 DECLARE
     v_store_id   INTEGER := (SELECT store_id   FROM stores   WHERE store_code = 'TEST-STORE');
@@ -427,6 +446,7 @@ DECLARE
     v_qty        NUMERIC;
     v_waste_qty  NUMERIC;
 BEGIN
+    PERFORM pg_temp.reset_fixture();
     INSERT INTO inventory_batches (batch_code, store_id, product_id,
                                    initial_qty, current_qty,
                                    manufacturing_date, expiration_date,
@@ -454,7 +474,6 @@ BEGIN
         FORMAT('written-off qty=%s (expected 7)', COALESCE(v_waste_qty, 0)));
 END;
 $$;
-ROLLBACK TO SAVEPOINT t4_1;
 
 -- T4.2: the datamart exists, is unique on its grain and refreshes cleanly.
 DO $$
@@ -507,8 +526,8 @@ SELECT COUNT(*) FILTER (WHERE outcome = 'PASS') AS passed,
        COUNT(*)                                  AS total
   FROM test_results;
 
--- Every assertion ran inside a SAVEPOINT that was rolled back, and the fixture
--- itself is discarded here: the database ends exactly as it started.
+-- The fixture and every row the tests created are discarded here: the
+-- database ends exactly as it started.
 ROLLBACK;
 
 \echo ''
