@@ -31,9 +31,10 @@
 param(
     [Parameter(Position = 0)]
     [ValidateSet('help', 'all', 'up', 'down', 'destroy', 'init-db', 'wait-db',
-                 'deps', 'generate', 'validate', 'run-etl', 'run-queries',
-                 'refresh-datamart', 'test', 'psql', 'logs', 'status',
-                 'clean-data')]
+                 'deps', 'deps-dev', 'pipeline', 'generate', 'validate', 'run-etl',
+                 'models', 'forecast', 'dq-report', 'experiment', 'run-queries',
+                 'refresh-datamart', 'test', 'test-unit', 'test-sql', 'psql',
+                 'logs', 'status', 'clean-data')]
     [string]$Command = 'help',
 
     [int]$Days = 60,
@@ -172,23 +173,31 @@ function Show-Help {
     Write-Host '  Usage: .\scripts\run_project.ps1 <command> [-Days 60] [-Seed 20261012]'
     Write-Host ''
     $tasks = [ordered]@{
-        'all'              = 'Full pipeline: infra -> data -> ETL -> analytics'
-        'up'               = 'Start PostgreSQL (DDL + seed + triggers on first boot)'
+        'all'              = 'Everything: infra -> pipeline -> analytical queries'
+        'pipeline'         = 'Run every stage in order, with retries and a run record'
+        'up'               = 'Start PostgreSQL (DDL + seed + triggers + ops/ml schemas)'
         'down'             = 'Stop containers, keep the data volume'
         'destroy'          = 'Stop containers AND delete the data volume (irreversible)'
         'init-db'          = 'Start the database and list the objects created'
         'wait-db'          = 'Block until the database reports healthy'
-        'deps'             = 'Install the Python dependencies'
+        'deps'             = 'Install the runtime dependencies'
+        'deps-dev'         = 'Install runtime + test dependencies'
         'generate'         = 'Generate the synthetic CSV datasets into data/raw/'
         'validate'         = 'Run the quality gate only -- no database needed'
-        'run-etl'          = 'Extract -> validate -> load the CSVs into PostgreSQL'
+        'run-etl'          = 'Extract -> quality gate -> upsert the CSVs into PostgreSQL'
+        'models'           = 'Build the star schema incrementally, then run model tests'
+        'forecast'         = 'Forecast demand, project expiry, recommend orders'
+        'dq-report'        = 'Render docs/data_quality_report.md from the quality history'
+        'experiment'       = 'Re-run the replenishment-policy experiment (stdlib only)'
         'run-queries'      = 'Execute the 4 advanced analytical queries'
         'refresh-datamart' = 'Refresh the Power BI materialized view concurrently'
-        'test'             = 'Run the SQL regression suite (FEFO + anti-fraud trigger)'
+        'test'             = 'Everything: the Python suite, then the SQL regression suite'
+        'test-unit'        = 'Python tests (integration ones skip if PostgreSQL is down)'
+        'test-sql'         = 'SQL regression suite: FEFO, anti-fraud trigger, datamart'
         'psql'             = 'Open an interactive psql shell'
         'logs'             = 'Tail the database logs'
         'status'           = 'Show container status and row counts'
-        'clean-data'       = 'Delete generated CSVs, quarantine files and the ETL log'
+        'clean-data'       = 'Delete generated CSVs, quarantine, quality records and the ETL log'
     }
     foreach ($key in $tasks.Keys) {
         Write-Host ('    {0,-18} {1}' -f $key, $tasks[$key])
@@ -260,13 +269,48 @@ UNION ALL SELECT 'daily_sales', COUNT(*) FROM daily_sales;
 
 function Invoke-CleanData {
     Write-Step 'Removing generated artifacts'
-    foreach ($pattern in @('data/raw/*.csv', 'data/quarantine/*.csv')) {
+    foreach ($pattern in @('data/raw/*.csv', 'data/raw/_manifest.json',
+                           'data/quarantine/*.csv', 'data/processed/*')) {
         Get-ChildItem -Path $pattern -ErrorAction SilentlyContinue | Remove-Item -Force
     }
     if (Test-Path 'docs/etl_execution.log') {
         Remove-Item 'docs/etl_execution.log' -Force
     }
+    if (Test-Path 'data/quality_runs') {
+        Remove-Item 'data/quality_runs' -Recurse -Force
+    }
     Write-Ok 'Generated CSVs, quarantine files and the ETL log were removed.'
+}
+
+function Invoke-Python {
+    <#
+        Run a Python entry point with the project's database settings exported,
+        and fail the task on a non-zero exit. The connection reaches the scripts
+        through RETAIL_DB_DSN (src/dbutil.py), so no script needs a flag for it.
+    #>
+    param([Parameter(ValueFromRemainingArguments = $true)][string[]]$PythonArgs)
+    $python = Resolve-Python
+    $env:RETAIL_DB_DSN = $Dsn
+    $env:RETAIL_TEST_ADMIN_DSN = "postgresql+psycopg2://${DbUser}:${DbPassword}@${DbHost}:${DbPort}/postgres"
+    & $python @PythonArgs
+    if ($LASTEXITCODE -ne 0) {
+        throw "python $($PythonArgs -join ' ') failed with exit code $LASTEXITCODE."
+    }
+}
+
+function Invoke-SqlFile {
+    <#
+        Feed a SQL file to psql through stdin. Piping avoids any dependence on
+        how a path is rewritten between the host and the container.
+    #>
+    param([Parameter(Mandatory = $true)][string]$RelativePath)
+    Assert-Docker
+    Get-Content -Raw -LiteralPath $RelativePath |
+        & docker compose exec -T -e "PGPASSWORD=$DbPassword" $Service `
+            psql -v ON_ERROR_STOP=1 -U $DbUser -d $DbName
+    if ($LASTEXITCODE -ne 0) {
+        throw "psql failed on $RelativePath (exit code $LASTEXITCODE)."
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -291,20 +335,51 @@ try {
         'wait-db'          { Wait-Database }
         'init-db'          { Invoke-InitDb }
         'deps'             { $p = Resolve-Python; & $p -m pip install -r requirements.txt }
+        'deps-dev'         { $p = Resolve-Python; & $p -m pip install -r requirements-dev.txt }
+        'pipeline' {
+            Write-Step 'Running the full pipeline'
+            Invoke-Python src/pipeline.py --days $Days --seed $Seed
+        }
+        'models' {
+            Write-Step 'Building and testing the star schema'
+            Invoke-Python src/model_runner.py
+        }
+        'forecast' {
+            Write-Step 'Forecasting demand and sizing replenishment'
+            Invoke-Python src/forecasting.py
+        }
+        'dq-report' {
+            Write-Step 'Rendering the data-quality report'
+            Invoke-Python src/dq_report.py
+        }
+        'experiment' {
+            Write-Step 'Running the replenishment-policy experiment'
+            Invoke-Python src/policy_experiment.py
+        }
         'generate'         { Invoke-Generate }
         'validate'         { Invoke-Validate }
         'run-etl'          { Invoke-Etl }
         'run-queries'      {
             Write-Step 'Executing the advanced analytical queries'
-            Invoke-Psql -File '/sql/03_analytical_queries.sql'
+            Invoke-SqlFile 'sql/03_analytical_queries.sql'
         }
         'refresh-datamart' {
             Write-Step 'Refreshing the Power BI datamart'
             Invoke-Psql -Sql 'SELECT fn_refresh_waste_datamart(TRUE);'
         }
-        'test' {
+        'test-unit' {
+            Write-Step 'Running the Python test suite'
+            Invoke-Python -m pytest tests -q
+        }
+        'test-sql' {
             Write-Step 'Running the SQL regression suite'
-            Invoke-Psql -File '/sql/05_tests_business_logic.sql'
+            Invoke-SqlFile 'sql/05_tests_business_logic.sql'
+        }
+        'test' {
+            Write-Step 'Running the Python test suite'
+            Invoke-Python -m pytest tests -q
+            Write-Step 'Running the SQL regression suite'
+            Invoke-SqlFile 'sql/05_tests_business_logic.sql'
         }
         'psql'       { & docker compose exec -e "PGPASSWORD=$DbPassword" $Service psql -U $DbUser -d $DbName }
         'logs'       { & docker compose logs -f $Service }
@@ -312,10 +387,10 @@ try {
         'clean-data' { Invoke-CleanData }
         'all' {
             Invoke-InitDb
-            Invoke-Generate
-            Invoke-Etl
+            Write-Step 'Running the full pipeline'
+            Invoke-Python src/pipeline.py --days $Days --seed $Seed
             Write-Step 'Executing the advanced analytical queries'
-            Invoke-Psql -File '/sql/03_analytical_queries.sql'
+            Invoke-SqlFile 'sql/03_analytical_queries.sql'
             Write-Step 'Pipeline complete'
             Write-Ok 'Infrastructure, data, ETL and analytics all finished successfully.'
             Write-Host '  Audit trail : docs/etl_execution.log' -ForegroundColor DarkGray

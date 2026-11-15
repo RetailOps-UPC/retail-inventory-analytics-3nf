@@ -17,8 +17,15 @@ env/
 # The datasets are reproducible from a fixed seed, so they are not versioned.
 # Run:  python src/data_generator.py
 data/raw/*.csv
+data/raw/_manifest.json
 data/quarantine/*.csv
 data/processed/*
+data/quality_runs/
+
+# Tracked on purpose (small, and the point of keeping them):
+#   docs/data_quality/history.jsonl   one line per ETL run: the quality trend
+#   docs/data_quality_report.md       rendered from it
+#   docs/experiments/*                the replenishment experiment report
 
 # --- ETL audit log (regenerated on every run) ------------------------------
 docs/etl_execution.log

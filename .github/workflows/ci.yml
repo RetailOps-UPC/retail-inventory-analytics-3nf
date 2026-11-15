@@ -1,0 +1,132 @@
+name: CI
+
+# Three jobs, ordered by cost:
+#   unit         no database; also proves the quality gate passes a clean dataset
+#   integration  real PostgreSQL 15: SQL regression suite, Python integration
+#                tests, and the whole pipeline end to end
+#   compose      the Docker Compose file still parses
+#
+# Integration runs against a PostgreSQL SERVICE CONTAINER on the runner, and the
+# tests create and drop their own throwaway databases inside it, so nothing is
+# shared between tests and nothing needs cleaning up.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    name: Unit tests (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: requirements*.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Unit tests
+        run: python -m pytest tests -m "not integration" -q
+
+      # A pristine dataset has no planted defects, so the STRICT gate
+      # (--fail-on-error) must pass it. If this step fails, a rule has started
+      # rejecting good data: the opposite failure to the one the unit tests guard.
+      - name: Quality gate accepts a clean dataset
+        run: |
+          python src/data_generator.py --no-inject-anomalies --days 30 \
+            --end-date 2026-10-11 --out "$RUNNER_TEMP/raw"
+          python src/etl_pipeline.py --dry-run --fail-on-error \
+            --raw-dir "$RUNNER_TEMP/raw" \
+            --log-file "$RUNNER_TEMP/etl.log" \
+            --quarantine-dir "$RUNNER_TEMP/quarantine" \
+            --quality-runs-dir "$RUNNER_TEMP/qruns" \
+            --quality-history "$RUNNER_TEMP/history.jsonl"
+
+      # The generator is deterministic: same seed and window, same bytes. A diff
+      # here means something made the simulation non-reproducible, which would
+      # silently invalidate every figure quoted from it.
+      - name: Generator is deterministic
+        run: |
+          python src/data_generator.py --end-date 2026-10-11 --out "$RUNNER_TEMP/a"
+          python src/data_generator.py --end-date 2026-10-11 --out "$RUNNER_TEMP/b"
+          diff -r "$RUNNER_TEMP/a" "$RUNNER_TEMP/b"
+
+  integration:
+    name: Integration (PostgreSQL 15)
+    runs-on: ubuntu-latest
+    needs: unit
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: retail_admin
+          POSTGRES_PASSWORD: retail_secret
+          POSTGRES_DB: retail_inventory_db
+          TZ: America/Lima
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U retail_admin -d retail_inventory_db"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      PGHOST: localhost
+      PGUSER: retail_admin
+      PGPASSWORD: retail_secret
+      PGDATABASE: retail_inventory_db
+      RETAIL_DB_DSN: postgresql+psycopg2://retail_admin:retail_secret@localhost:5432/retail_inventory_db
+      RETAIL_TEST_ADMIN_DSN: postgresql+psycopg2://retail_admin:retail_secret@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements*.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      # Same order docker-compose mounts them in.
+      - name: Initialise the database
+        run: |
+          for f in 01_schema_ddl_3nf 02_seed_data 04_triggers_and_procedures 06_ops_schema 07_ml_schema; do
+            psql -v ON_ERROR_STOP=1 -q -f "sql/$f.sql"
+          done
+
+      - name: SQL regression suite (FEFO, anti-fraud trigger, datamart)
+        run: psql -v ON_ERROR_STOP=1 -f sql/05_tests_business_logic.sql
+
+      - name: Python tests, including integration
+        run: python -m pytest tests -q
+
+      - name: The pipeline runs end to end, twice
+        run: |
+          python src/pipeline.py --days 50 --seed 20261012 --end-date 2026-11-14 --retries 3
+          python src/pipeline.py --days 50 --seed 20261012 --end-date 2026-11-14 --skip generate
+
+  compose:
+    name: Compose file is valid
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose config --quiet

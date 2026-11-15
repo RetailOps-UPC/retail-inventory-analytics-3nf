@@ -3,11 +3,12 @@
 # =============================================================================
 # Quick start:
 #     make up          # start PostgreSQL 15 (schema + seed + triggers applied)
-#     make generate    # build 60 days of synthetic operations data
-#     make run-etl     # load CSV -> PostgreSQL with the quality gate
-#     make run-queries # execute the 4 analytical queries
+#     make pipeline    # generate -> quality gate -> load -> star schema -> forecast
+#     make test        # 300+ Python tests, then the SQL regression suite
 #
-# Or everything at once:  make all
+# Everything, from nothing:  make all
+#
+# The stages can also be run one at a time; see `make help`.
 #
 # Windows without make: use the PowerShell equivalent, scripts/run_project.ps1
 # =============================================================================
@@ -23,14 +24,26 @@ DB_PORT        ?= 5433
 PYTHON         ?= python
 SIM_DAYS       ?= 60
 SIM_SEED       ?= 20261012
+# Last simulated day. Empty means "yesterday", so the data (and every figure derived
+# from it) moves each day. Pin it to reproduce the numbers quoted in the docs:
+#     make generate SIM_END=2026-10-11
+SIM_END        ?=
+SIM_END_ARG    := $(if $(SIM_END),--end-date $(SIM_END),)
 
 DSN            := postgresql+psycopg2://$(DB_USER):$(DB_PASSWORD)@$(DB_HOST):$(DB_PORT)/$(DB_NAME)
 PSQL           := $(COMPOSE) exec -T -e PGPASSWORD=$(DB_PASSWORD) $(SERVICE) \
                   psql -v ON_ERROR_STOP=1 -U $(DB_USER) -d $(DB_NAME)
 
+# The connection the Python entry points read (src/dbutil.py).
+export RETAIL_DB_DSN := $(DSN)
+# The integration tests create and drop throwaway databases, so they need a
+# role that can CREATE DATABASE on the maintenance database.
+export RETAIL_TEST_ADMIN_DSN ?= postgresql+psycopg2://$(DB_USER):$(DB_PASSWORD)@$(DB_HOST):$(DB_PORT)/postgres
+
 .DEFAULT_GOAL  := help
-.PHONY: help all up down destroy init-db wait-db generate run-etl validate \
-        run-queries refresh-datamart test psql logs status clean-data deps
+.PHONY: help all up down destroy init-db wait-db deps deps-dev generate validate \
+        run-etl models forecast pipeline dq-report experiment run-queries \
+        refresh-datamart test test-unit test-sql psql logs status clean-data
 
 # -----------------------------------------------------------------------------
 help: ## Show this help
@@ -41,10 +54,10 @@ help: ## Show this help
 	@echo ""
 	@echo "Database: $(DB_USER)@$(DB_HOST):$(DB_PORT)/$(DB_NAME)"
 
-all: init-db generate run-etl run-queries ## Full pipeline: infra -> data -> ETL -> analytics
+all: init-db pipeline run-queries ## Everything: infra -> pipeline -> analytical queries
 
 # --- Infrastructure ----------------------------------------------------------
-up: ## Start PostgreSQL (applies DDL + seed + triggers on first boot)
+up: ## Start PostgreSQL (applies DDL + seed + triggers + ops/ml schemas on first boot)
 	$(COMPOSE) up -d $(SERVICE)
 
 down: ## Stop containers, keep the data volume
@@ -69,29 +82,55 @@ init-db: up wait-db ## Start the database and confirm the schema is in place
 	@$(PSQL) -c "SELECT routine_name, routine_type FROM information_schema.routines WHERE routine_schema = 'public' ORDER BY routine_name;"
 	@$(PSQL) -c "SELECT tgname AS trigger_name, relname AS table_name FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid WHERE NOT t.tgisinternal;"
 
-# --- Data --------------------------------------------------------------------
-deps: ## Install the Python dependencies
+# --- Python environment ------------------------------------------------------
+deps: ## Install the runtime dependencies
 	$(PYTHON) -m pip install -r requirements.txt
 
+deps-dev: ## Install runtime + test dependencies
+	$(PYTHON) -m pip install -r requirements-dev.txt
+
+# --- The pipeline, as one command or stage by stage --------------------------
+pipeline: ## Run every stage in order, with retries and a run record
+	$(PYTHON) src/pipeline.py --days $(SIM_DAYS) --seed $(SIM_SEED) $(SIM_END_ARG)
+
 generate: ## Generate the synthetic CSV datasets into data/raw/
-	$(PYTHON) src/data_generator.py --days $(SIM_DAYS) --seed $(SIM_SEED)
+	$(PYTHON) src/data_generator.py --days $(SIM_DAYS) --seed $(SIM_SEED) $(SIM_END_ARG)
 
 validate: ## Run the quality gate only -- no database needed
 	$(PYTHON) src/etl_pipeline.py --dry-run
 
-run-etl: ## Extract -> validate -> load the CSV datasets into PostgreSQL
+run-etl: ## Extract -> quality gate -> upsert the CSV datasets into PostgreSQL
 	$(PYTHON) src/etl_pipeline.py --dsn "$(DSN)"
 
+models: ## Build the star schema incrementally, then run the model tests
+	$(PYTHON) src/model_runner.py
+
+forecast: ## Forecast demand, project expiry, recommend orders
+	$(PYTHON) src/forecasting.py
+
+dq-report: ## Render docs/data_quality_report.md from the quality history
+	$(PYTHON) src/dq_report.py
+
+experiment: ## Re-run the replenishment-policy experiment (~15 s, stdlib only)
+	$(PYTHON) src/policy_experiment.py
+
 # --- Analytics ---------------------------------------------------------------
+# SQL is fed through stdin rather than `psql -f /sql/...`: Git Bash on Windows
+# rewrites a leading-slash argument into a Windows path and the file is never found.
 run-queries: ## Execute the 4 advanced analytical queries
-	@$(PSQL) -f /sql/03_analytical_queries.sql
+	@$(PSQL) < sql/03_analytical_queries.sql
 
 refresh-datamart: ## Refresh the Power BI materialized view concurrently
 	@$(PSQL) -c "SELECT fn_refresh_waste_datamart(TRUE);"
 
 # --- Verification ------------------------------------------------------------
-test: ## Run the SQL regression suite against the live database
-	@$(PSQL) -f /sql/05_tests_business_logic.sql
+test: test-unit test-sql ## Everything: the Python suite, then the SQL regression suite
+
+test-unit: ## Python tests (unit + integration; integration skips if PostgreSQL is down)
+	$(PYTHON) -m pytest tests -q
+
+test-sql: ## SQL regression suite: FEFO, anti-fraud trigger, datamart (19 assertions)
+	@$(PSQL) < sql/05_tests_business_logic.sql
 
 # --- Utilities ---------------------------------------------------------------
 psql: ## Open an interactive psql shell
@@ -101,7 +140,7 @@ psql: ## Open an interactive psql shell
 logs: ## Tail the database logs
 	$(COMPOSE) logs -f $(SERVICE)
 
-status: ## Show container and row-count status
+status: ## Show container status and row counts
 	@$(COMPOSE) ps
 	@$(PSQL) -c "SELECT 'stores' AS table, COUNT(*) FROM stores \
 	  UNION ALL SELECT 'products', COUNT(*) FROM products \
@@ -111,6 +150,6 @@ status: ## Show container and row-count status
 	  UNION ALL SELECT 'waste_log', COUNT(*) FROM waste_log \
 	  UNION ALL SELECT 'daily_sales', COUNT(*) FROM daily_sales;"
 
-clean-data: ## Delete generated CSVs, quarantine files and the ETL log
-	rm -rf data/raw/*.csv data/quarantine/*.csv docs/etl_execution.log
+clean-data: ## Delete generated CSVs, quarantine, quality records and the ETL log
+	rm -rf data/raw/*.csv data/raw/_manifest.json data/quarantine/*.csv data/quality_runs data/processed/* docs/etl_execution.log
 	@echo "Generated artifacts removed."
