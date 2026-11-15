@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import os
 import random
 import statistics
@@ -68,6 +69,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_RUNS_CSV = PROJECT_ROOT / "data" / "processed" / "policy_experiment_runs.csv"
 DEFAULT_REPORT = PROJECT_ROOT / "docs" / "experiments" / "policy_comparison.md"
 DEFAULT_FRONTIER = PROJECT_ROOT / "docs" / "experiments" / "policy_frontier.svg"
+DEFAULT_SUMMARY = PROJECT_ROOT / "docs" / "experiments" / "policy_summary.json"
 
 #: Fixed window so the report is reproducible whatever day it is run.
 DEFAULT_END_DATE = "2026-10-11"
@@ -537,6 +539,48 @@ def build_report(experiment: Dict) -> str:
     return "\n".join(lines)
 
 
+def build_summary(experiment: Dict) -> Dict:
+    """Machine-readable results, for the web app. The same numbers as the report."""
+    test = experiment["test_rows"]
+    by_policy = {p: [r for r in test if r["policy"] == p]
+                 for p in ("heuristic", "level", "forecast")}
+    means = {p: {m: mean(r[m] for r in rows) for m in METRICS}
+             for p, rows in by_policy.items()}
+
+    def diff(a: str, b: str) -> Dict[str, Dict]:
+        return {m: paired_diff(by_policy[a], by_policy[b], m)
+                for m in ("net_profit", "waste_cost", "expiry_waste", "lost_revenue")}
+
+    train = experiment["train_rows"]
+    heur = [r for r in train if r["policy"] == "heuristic"]
+    frontier = {"heuristic": [{
+        "z": None, "waste_cost": mean(r["waste_cost"] for r in heur),
+        "lost_revenue": mean(r["lost_revenue"] for r in heur),
+        "net_profit": mean(r["net_profit"] for r in heur)}]}
+    for policy in ("level", "forecast"):
+        frontier[policy] = [{
+            "z": z, "chosen": abs(z - experiment["best_z"][policy]) < 1e-9,
+            "waste_cost": experiment["frontier"][policy][z]["waste_cost"],
+            "lost_revenue": experiment["frontier"][policy][z]["lost_revenue"],
+            "net_profit": experiment["frontier"][policy][z]["net_profit"]} for z in Z_GRID]
+
+    net = diff("forecast", "heuristic")["net_profit"]
+    # One run is 60 days of a 4-store network; scale to a 400-store chain per year.
+    scale = 365 / experiment["days"] / 4 * 400
+    return {
+        "end_date": experiment["end"], "days": experiment["days"],
+        "train_seeds": len(experiment["train_seeds"]), "test_seeds": len(experiment["test_seeds"]),
+        "best_z": experiment["best_z"], "means": means,
+        "diffs": {"forecast_vs_heuristic": diff("forecast", "heuristic"),
+                  "level_vs_heuristic": diff("level", "heuristic"),
+                  "forecast_vs_level": diff("forecast", "level")},
+        "frontier": frontier,
+        "annualized_400_stores": {"net_gain": net["mean"] * scale, "ci_low": net["lo"] * scale,
+                                  "ci_high": net["hi"] * scale},
+        "share_of_gross_saving_kept": net["mean"] / -diff("forecast", "heuristic")["waste_cost"]["mean"],
+    }
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -555,6 +599,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--runs-csv", type=Path, default=DEFAULT_RUNS_CSV)
     parser.add_argument("--report", type=Path, default=DEFAULT_REPORT)
     parser.add_argument("--frontier-svg", type=Path, default=DEFAULT_FRONTIER)
+    parser.add_argument("--summary-json", type=Path, default=DEFAULT_SUMMARY)
     return parser.parse_args(argv)
 
 
@@ -580,12 +625,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     args.report.parent.mkdir(parents=True, exist_ok=True)
     args.report.write_text(build_report(experiment), encoding="utf-8")
     args.frontier_svg.write_text(frontier_svg(experiment), encoding="utf-8")
+    args.summary_json.write_text(
+        json.dumps(build_summary(experiment), indent=2) + "\n", encoding="utf-8")
 
     elapsed = (datetime.now() - started).total_seconds()
     print(f"Chosen service levels (train): {experiment['best_z']}")
     print(f"Wrote {args.runs_csv.relative_to(PROJECT_ROOT)}")
     print(f"Wrote {args.report.relative_to(PROJECT_ROOT)}")
     print(f"Wrote {args.frontier_svg.relative_to(PROJECT_ROOT)}")
+    print(f"Wrote {args.summary_json.relative_to(PROJECT_ROOT)}")
     print(f"Done in {elapsed:.1f}s")
     return 0
 

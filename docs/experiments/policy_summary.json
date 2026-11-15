@@ -1,0 +1,232 @@
+{
+  "end_date": "2026-10-11",
+  "days": 60,
+  "train_seeds": 20,
+  "test_seeds": 100,
+  "best_z": {
+    "level": 2.05,
+    "forecast": 2.5
+  },
+  "means": {
+    "heuristic": {
+      "net_profit": 178104.79058499998,
+      "gross_margin": 180448.065,
+      "waste_cost": 2343.274415,
+      "expiry_waste": 1777.783425,
+      "lost_revenue": 3729.3210000000004,
+      "fill_rate": 0.9923061285951528
+    },
+    "level": {
+      "net_profit": 177293.786115,
+      "gross_margin": 178802.1416,
+      "waste_cost": 1508.355485,
+      "expiry_waste": 1001.060887,
+      "lost_revenue": 7773.503999999999,
+      "fill_rate": 0.9836320826820264
+    },
+    "forecast": {
+      "net_profit": 178756.114344,
+      "gross_margin": 180137.3339,
+      "waste_cost": 1381.2195559999998,
+      "expiry_waste": 835.666235,
+      "lost_revenue": 4873.726000000001,
+      "fill_rate": 0.9896898956637926
+    }
+  },
+  "diffs": {
+    "forecast_vs_heuristic": {
+      "net_profit": {
+        "mean": 651.3237589999978,
+        "lo": 357.88898699999436,
+        "hi": 952.1812579999958,
+        "n": 100,
+        "significant": true
+      },
+      "waste_cost": {
+        "mean": -962.054859,
+        "lo": -1027.6492449999998,
+        "hi": -896.192744,
+        "n": 100,
+        "significant": true
+      },
+      "expiry_waste": {
+        "mean": -942.1171899999999,
+        "lo": -998.8137150000001,
+        "hi": -883.155545,
+        "n": 100,
+        "significant": true
+      },
+      "lost_revenue": {
+        "mean": 1144.405,
+        "lo": 973.2770000000002,
+        "hi": 1314.0590000000002,
+        "n": 100,
+        "significant": true
+      }
+    },
+    "level_vs_heuristic": {
+      "net_profit": {
+        "mean": -811.0044700000016,
+        "lo": -1110.1884320000054,
+        "hi": -503.8771779999963,
+        "n": 100,
+        "significant": true
+      },
+      "waste_cost": {
+        "mean": -834.9189299999999,
+        "lo": -893.329111,
+        "hi": -773.820166,
+        "n": 100,
+        "significant": true
+      },
+      "expiry_waste": {
+        "mean": -776.7225380000001,
+        "lo": -830.290998,
+        "hi": -721.110506,
+        "n": 100,
+        "significant": true
+      },
+      "lost_revenue": {
+        "mean": 4044.1829999999986,
+        "lo": 3831.181999999999,
+        "hi": 4250.4079999999985,
+        "n": 100,
+        "significant": true
+      }
+    },
+    "forecast_vs_level": {
+      "net_profit": {
+        "mean": 1462.3282289999995,
+        "lo": 1209.1137270000006,
+        "hi": 1713.6909469999969,
+        "n": 100,
+        "significant": true
+      },
+      "waste_cost": {
+        "mean": -127.13592900000002,
+        "lo": -194.95217200000002,
+        "hi": -58.275726999999996,
+        "n": 100,
+        "significant": true
+      },
+      "expiry_waste": {
+        "mean": -165.39465199999998,
+        "lo": -230.16984799999997,
+        "hi": -99.493854,
+        "n": 100,
+        "significant": true
+      },
+      "lost_revenue": {
+        "mean": -2899.777999999999,
+        "lo": -3098.5059999999985,
+        "hi": -2700.643999999999,
+        "n": 100,
+        "significant": true
+      }
+    }
+  },
+  "frontier": {
+    "heuristic": [
+      {
+        "z": null,
+        "waste_cost": 2349.439485,
+        "lost_revenue": 3779.15,
+        "net_profit": 178469.212515
+      }
+    ],
+    "level": [
+      {
+        "z": 1.28,
+        "chosen": false,
+        "waste_cost": 420.54092499999996,
+        "lost_revenue": 23942.519999999997,
+        "net_profit": 170683.089075
+      },
+      {
+        "z": 1.65,
+        "chosen": false,
+        "waste_cost": 658.67268,
+        "lost_revenue": 13056.419999999996,
+        "net_profit": 175672.09432
+      },
+      {
+        "z": 2.05,
+        "chosen": true,
+        "waste_cost": 1451.301185,
+        "lost_revenue": 8168.315,
+        "net_profit": 177158.968315
+      },
+      {
+        "z": 2.5,
+        "chosen": false,
+        "waste_cost": 3129.70085,
+        "lost_revenue": 4865.47,
+        "net_profit": 176703.72264999998
+      },
+      {
+        "z": 3.0,
+        "chosen": false,
+        "waste_cost": 5389.190035,
+        "lost_revenue": 3110.9750000000004,
+        "net_profit": 175059.459465
+      },
+      {
+        "z": 3.5,
+        "chosen": false,
+        "waste_cost": 8208.788400000001,
+        "lost_revenue": 2278.7250000000004,
+        "net_profit": 173134.69809999998
+      }
+    ],
+    "forecast": [
+      {
+        "z": 1.28,
+        "chosen": false,
+        "waste_cost": 472.18345,
+        "lost_revenue": 17040.55999999999,
+        "net_profit": 173908.57605
+      },
+      {
+        "z": 1.65,
+        "chosen": false,
+        "waste_cost": 586.3388600000001,
+        "lost_revenue": 10352.024999999998,
+        "net_profit": 176554.23114
+      },
+      {
+        "z": 2.05,
+        "chosen": false,
+        "waste_cost": 745.0911699999999,
+        "lost_revenue": 7173.045,
+        "net_profit": 178027.66233
+      },
+      {
+        "z": 2.5,
+        "chosen": true,
+        "waste_cost": 1378.1512699999998,
+        "lost_revenue": 4556.860000000001,
+        "net_profit": 178543.14173
+      },
+      {
+        "z": 3.0,
+        "chosen": false,
+        "waste_cost": 2293.3761,
+        "lost_revenue": 3216.7750000000005,
+        "net_profit": 178234.4249
+      },
+      {
+        "z": 3.5,
+        "chosen": false,
+        "waste_cost": 3697.861485,
+        "lost_revenue": 2425.26,
+        "net_profit": 177129.645515
+      }
+    ]
+  },
+  "annualized_400_stores": {
+    "net_gain": 396221.9533916653,
+    "ci_low": 217715.80042499653,
+    "ci_high": 579243.5986166641
+  },
+  "share_of_gross_saving_kept": 0.6770131171906465
+}

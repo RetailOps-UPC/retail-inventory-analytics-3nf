@@ -3,6 +3,8 @@
 > 🚀 **Dashboard Web Interactivo en Vivo:** [retail-inventory-web.vercel.app](https://retail-inventory-web.vercel.app/)  
 > 📁 **Repositorio del Frontend:** [`MrOdar/retail-inventory-web`](https://github.com/MrOdar/retail-inventory-web)
 
+> ℹ️ **Aviso:** proyecto académico. El caso está inspirado en una cadena de tiendas de conveniencia peruana; todos los datos son sintéticos (generados por `src/data_generator.py`), sin afiliación ni relación con ninguna empresa real. Los nombres de sedes y marcas son ilustrativos.
+
 [![Live Demo](https://img.shields.io/badge/Demo_en_Vivo-Vercel_App-000000?style=flat&logo=vercel&logoColor=white)](https://retail-inventory-web.vercel.app/)
 [![PostgreSQL](https://img.shields.io/badge/Base_de_Datos-PostgreSQL_15-336791?style=flat&logo=postgresql&logoColor=white)](https://www.postgresql.org/)
 [![Docker](https://img.shields.io/badge/Infraestructura-Docker_Compose-2496ED?style=flat&logo=docker&logoColor=white)](docker-compose.yml)
