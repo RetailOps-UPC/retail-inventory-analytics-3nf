@@ -70,7 +70,7 @@ import sys
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 try:
     import pandas as pd
@@ -79,6 +79,10 @@ except ImportError:  # pragma: no cover - dependency guidance
         "FATAL: pandas is required.\n"
         "       Install the pipeline dependencies with:  pip install -r requirements.txt\n")
     raise SystemExit(3)
+
+# Sibling module: rule catalog, ground-truth scoring and run records. Imported
+# by name (not relatively) so the file still runs as a plain script.
+import dq  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -145,6 +149,10 @@ class ETLReport:
     quarantined: Dict[str, int] = field(default_factory=dict)
     loaded: Dict[str, int] = field(default_factory=dict)
     findings: List[Finding] = field(default_factory=list)
+    #: One entry per rule per dataset, INCLUDING rules that found nothing.
+    #: `findings` only holds the ones that fired, which cannot yield a pass
+    #: rate: zero findings is indistinguishable from a rule that never ran.
+    rule_results: List[dq.RuleResult] = field(default_factory=list)
     aborted_reason: Optional[str] = None
 
     def add(self, finding: Finding) -> None:
@@ -373,6 +381,9 @@ class QualityGate:
         self.report = report
         #: filename -> DataFrame of rejected rows (with a _reject_rule column).
         self.quarantine: Dict[str, pd.DataFrame] = {}
+        #: (rule_id, dataset) -> natural keys of the rows that rule flagged.
+        #: Needed to score the gate against the generator's ground truth.
+        self.failed_keys: Dict[Tuple[str, str], Set[Tuple[str, ...]]] = {}
 
     # -- helpers ------------------------------------------------------------
 
@@ -409,6 +420,18 @@ class QualityGate:
         """
         mask = mask.fillna(False).astype(bool)
         affected = int(mask.sum())
+
+        # Record the evaluation unconditionally: this is what makes a pass
+        # rate computable. Only rules that fire become log-worthy findings.
+        self.report.rule_results.append(dq.RuleResult(
+            rule_id=rule_id, dataset=filename, severity=severity,
+            evaluated=len(frame), failed=affected))
+        if affected:
+            key_columns = list(CONTRACTS_BY_NAME[filename].natural_key)
+            if key_columns:
+                self.failed_keys.setdefault((rule_id, filename), set()).update(
+                    tuple(str(v) for v in row) for row in
+                    frame.loc[mask, key_columns].itertuples(index=False, name=None))
 
         self.report.add(Finding(
             rule_id=rule_id, dataset=filename, severity=severity,
@@ -503,26 +526,33 @@ class QualityGate:
         #      schema stores it as discrepancy_qty) but it is the single most
         #      important supplier-compliance signal, so it is reported.
         discrepancy = frame["qty_dispatched"] - frame["qty_accepted"]
-        self.report.add(Finding(
-            "R04", name, Severity.WARNING,
+        frame = self._apply(
+            name, frame, discrepancy > 0, "R04", Severity.WARNING,
             "Dispatch guide vs. physical count discrepancy detected "
             f"(total short-received units: "
             f"{float(discrepancy[discrepancy > 0].sum()):.2f}).",
-            int((discrepancy > 0).sum()),
-            self._sample(frame.loc[discrepancy > 0],
-                         ("grn_number", "sku_code", "qty_dispatched",
-                          "qty_accepted"))))
+            ("grn_number", "sku_code", "qty_dispatched", "qty_accepted"))
+
+        # R06: a shortage is a business fact only if somebody wrote down why.
+        #      Short-received lines WITHOUT a note are the dangerous subset of
+        #      R04: hidden supplier shrinkage nobody will ever claim. This is
+        #      the rule that separates a documented rejection from a gap.
+        if "notes" in frame.columns:
+            frame = self._apply(
+                name, frame, (discrepancy > 0) & frame["notes"].isna(),
+                "R06", Severity.WARNING,
+                "Shortage against the dispatch guide with NO documented reason "
+                "(undocumented supplier shrinkage).",
+                ("grn_number", "sku_code", "qty_dispatched", "qty_accepted"))
 
         # R05: cold-chain reading outside the acceptable intake band.
         if "temperature_celsius" in frame.columns:
             out_of_band = (frame["temperature_celsius"].notna()
                            & ~frame["temperature_celsius"].between(-25.0, 85.0))
-            self.report.add(Finding(
-                "R05", name, Severity.WARNING,
+            frame = self._apply(
+                name, frame, out_of_band, "R05", Severity.WARNING,
                 "Intake temperature reading outside the plausible -25C..85C band.",
-                int(out_of_band.sum()),
-                self._sample(frame.loc[out_of_band],
-                             ("grn_number", "sku_code", "temperature_celsius"))))
+                ("grn_number", "sku_code", "temperature_celsius"))
 
         return frame
 
@@ -569,14 +599,12 @@ class QualityGate:
             mismatch = pd.Series(
                 [o is not None and pd.notna(x) and abs(o - float(x)) > 1
                  for o, x in zip(observed, expected)], index=frame.index)
-            self.report.add(Finding(
-                "B05", name, Severity.WARNING,
+            frame = self._apply(
+                name, frame, mismatch, "B05", Severity.WARNING,
                 "Observed shelf life differs from the SKU master by more than "
                 "1 day (possible supplier mislabelling).",
-                int(mismatch.sum()),
-                self._sample(frame.loc[mismatch],
-                             ("batch_code", "sku_code", "manufacturing_date",
-                              "expiration_date"))))
+                ("batch_code", "sku_code", "manufacturing_date",
+                 "expiration_date"))
 
         # B06: an ACTIVE batch already past its expiry date is unsellable stock
         #      sitting on the shelf -- an operational alert, not a data defect.
@@ -585,14 +613,11 @@ class QualityGate:
                         & frame["expiration_date"].notna()
                         & (frame["expiration_date"] < today)
                         & (frame["current_qty"] > 0))
-        self.report.add(Finding(
-            "B06", name, Severity.WARNING,
+        frame = self._apply(
+            name, frame, stale_active, "B06", Severity.WARNING,
             "ACTIVE batch past its expiration date still holding stock: "
             "FEFO rotation failure requiring immediate write-off.",
-            int(stale_active.sum()),
-            self._sample(frame.loc[stale_active],
-                         ("batch_code", "store_code", "expiration_date",
-                          "current_qty"))))
+            ("batch_code", "store_code", "expiration_date", "current_qty"))
 
         return frame
 
@@ -654,14 +679,12 @@ class QualityGate:
         # S02: selling below cost destroys margin. Legitimate during clearance
         #      markdowns, so it is a warning the category manager should see.
         below_cost = frame["gross_revenue"] < frame["cost_of_goods_sold"]
-        self.report.add(Finding(
-            "S02", name, Severity.WARNING,
+        frame = self._apply(
+            name, frame, below_cost, "S02", Severity.WARNING,
             "Gross revenue below cost of goods sold: negative margin "
             "(clearance markdown or mispriced SKU).",
-            int(below_cost.sum()),
-            self._sample(frame.loc[below_cost],
-                         ("store_code", "sku_code", "sale_date",
-                          "gross_revenue", "cost_of_goods_sold"))))
+            ("store_code", "sku_code", "sale_date", "gross_revenue",
+             "cost_of_goods_sold"))
 
         # S03: revenue without units (or units without revenue) is incoherent.
         incoherent = (((frame["units_sold"] == 0) & (frame["gross_revenue"] > 0))
@@ -675,11 +698,10 @@ class QualityGate:
         # S04: future-dated sales indicate a POS clock or timezone fault.
         today = datetime.now().date()
         future = frame["sale_date"].notna() & (frame["sale_date"] > today)
-        self.report.add(Finding(
-            "S04", name, Severity.WARNING,
+        frame = self._apply(
+            name, frame, future, "S04", Severity.WARNING,
             "Sale dated in the future: POS clock or timezone misconfiguration.",
-            int(future.sum()),
-            self._sample(frame.loc[future], ("store_code", "sku_code", "sale_date"))))
+            ("store_code", "sku_code", "sale_date"))
 
         return frame
 
@@ -979,15 +1001,6 @@ class Loader:
         if items.empty:
             return
 
-        # goods_receipt_items has no natural unique constraint, so a plain
-        # INSERT would duplicate lines on a re-run. The (grn_id, product_id)
-        # pair is the real business key: delete those lines, then insert.
-        connection.execute(text(
-            "DELETE FROM goods_receipt_items "
-            " WHERE grn_id = :grn_id AND product_id = :product_id"),
-            [{"grn_id": int(g), "product_id": int(p)}
-             for g, p in zip(items["grn_id"], items["product_id"])])
-
         item_rows = self._records(items, {
             "grn_id": "grn_id", "product_id": "product_id",
             "qty_dispatched": "qty_dispatched", "qty_accepted": "qty_accepted",
@@ -997,12 +1010,37 @@ class Loader:
             row["grn_id"] = int(row["grn_id"])
             row["product_id"] = int(row["product_id"])
 
-        columns = list(item_rows[0].keys())
-        statement = text(
-            f"INSERT INTO goods_receipt_items ({', '.join(columns)}) "
-            f"VALUES ({', '.join(':' + c for c in columns)})")
+        # goods_receipt_items has no UNIQUE constraint, so ON CONFLICT is not
+        # available. The (grn_id, product_id) pair is the real business key,
+        # and the load is an explicit UPDATE-then-INSERT-if-missing.
+        #
+        # It must NOT be DELETE-then-INSERT: inventory_batches.grn_item_id
+        # references these rows, so deleting them breaks the foreign key on
+        # every re-run (and would orphan the batch -> receipt lineage even if
+        # the FK were absent). Updating in place keeps each grn_item_id stable
+        # across runs, which is what makes the whole pipeline idempotent.
+        update_statement = text(
+            "UPDATE goods_receipt_items "
+            "   SET qty_dispatched = :qty_dispatched, "
+            "       qty_accepted = :qty_accepted, "
+            "       unit_purchase_cost = :unit_purchase_cost, "
+            "       temperature_celsius = :temperature_celsius "
+            " WHERE grn_id = :grn_id AND product_id = :product_id")
+        insert_statement = text(
+            "INSERT INTO goods_receipt_items "
+            "  (grn_id, product_id, qty_dispatched, qty_accepted, "
+            "   unit_purchase_cost, temperature_celsius) "
+            "SELECT :grn_id, :product_id, "
+            "       CAST(:qty_dispatched AS NUMERIC), CAST(:qty_accepted AS NUMERIC), "
+            "       CAST(:unit_purchase_cost AS NUMERIC), "
+            "       CAST(:temperature_celsius AS NUMERIC) "
+            " WHERE NOT EXISTS (SELECT 1 FROM goods_receipt_items "
+            "                    WHERE grn_id = :grn_id AND product_id = :product_id)")
+
         for start in range(0, len(item_rows), LOAD_CHUNK_SIZE):
-            connection.execute(statement, item_rows[start:start + LOAD_CHUNK_SIZE])
+            chunk = item_rows[start:start + LOAD_CHUNK_SIZE]
+            connection.execute(update_statement, chunk)
+            connection.execute(insert_statement, chunk)
         self._log_loaded("goods_receipt_items", len(item_rows))
 
     def _load_batches(self, connection, frame: Optional["pd.DataFrame"],
@@ -1236,6 +1274,54 @@ def write_summary(report: ETLReport, dry_run: bool) -> None:
 # CLI
 # ---------------------------------------------------------------------------
 
+def record_quality_run(report: ETLReport, gate: QualityGate, args: argparse.Namespace,
+                       exit_code: int) -> Optional[Dict[str, Any]]:
+    """Score the gate, write the run record and persist it. Never raises.
+
+    A failure to write the audit trail must not change the outcome of a load
+    that already committed, so every step here is guarded and logged.
+    """
+    try:
+        manifest = dq.load_manifest(args.raw_dir)
+        ground_truth = dq.score_ground_truth(manifest, gate.failed_keys)
+        record = dq.build_run_record(
+            run_id=os.environ.get("PIPELINE_RUN_ID"),
+            started_at=report.started_at,
+            finished_at=report.finished_at or datetime.now(),
+            status="FAILED" if exit_code else "SUCCESS",
+            dry_run=args.dry_run, extracted=report.extracted,
+            quarantined=report.quarantined, loaded=report.loaded,
+            results=report.rule_results, ground_truth=ground_truth,
+            manifest=manifest, aborted_reason=report.aborted_reason)
+        record_path, history_path = dq.write_run_record(
+            record, runs_dir=args.quality_runs_dir,
+            history_path=args.quality_history)
+        LOGGER.info("  quality run record -> %s", record_path.name)
+        LOGGER.info("  quality history    -> %s", history_path)
+        for result in ground_truth:
+            LOGGER.info("  gate vs ground truth: %-28s %s caught %d of %d injected"
+                        "%s", result.kind, result.rule_id, result.detected,
+                        result.injected,
+                        f" (missed: {', '.join(result.missed)})" if result.missed else "")
+    except Exception as exc:  # noqa: BLE001 - audit trail is best-effort
+        LOGGER.warning("  could not write the quality run record: %s: %s",
+                       type(exc).__name__, exc)
+        return None
+
+    if not args.dry_run and not exit_code:
+        try:
+            from sqlalchemy import create_engine
+            engine = create_engine(args.dsn, future=True, pool_pre_ping=True)
+            dq_run_id = dq.persist_to_db(engine, record)
+            LOGGER.info("  quality results persisted to ops.dq_* (dq_run_id=%d)",
+                        dq_run_id)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("  quality results NOT persisted to the database: "
+                           "%s (apply sql/06_ops_schema.sql to enable it)",
+                           type(exc).__name__)
+    return record
+
+
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="ETL pipeline: data/raw CSV -> PostgreSQL 3NF schema, "
@@ -1250,6 +1336,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--quarantine-dir", type=Path,
                         default=DEFAULT_QUARANTINE_DIR,
                         help="Directory for rejected rows.")
+    parser.add_argument("--quality-runs-dir", type=Path, default=dq.DEFAULT_RUNS_DIR,
+                        help="Directory for full per-run quality records (untracked).")
+    parser.add_argument("--quality-history", type=Path,
+                        default=dq.DEFAULT_HISTORY_PATH,
+                        help="JSONL history of quality runs (kept under version control).")
     parser.add_argument("--dry-run", action="store_true",
                         help="Run extract + quality checks only; never connect "
                              "to the database.")
@@ -1296,6 +1387,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         exit_code = 1
 
     write_summary(report, args.dry_run)
+    record_quality_run(report, gate, args, exit_code)
 
     if exit_code == 0 and args.fail_on_error:
         errors = report.counts_by_severity.get(Severity.ERROR, 0)
