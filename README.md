@@ -9,12 +9,17 @@
 [![Python](https://img.shields.io/badge/ETL-Python_3.9+_·_pandas_·_SQLAlchemy-3776AB?style=flat&logo=python&logoColor=white)](src/etl_pipeline.py)
 [![Schema](https://img.shields.io/badge/Arquitectura-3NF_Relacional-orange?style=flat)](#3-arquitectura-relacional-3nf)
 [![PL/pgSQL](https://img.shields.io/badge/Lógica_de_Negocio-Stored_Procedures_%26_Triggers-336791?style=flat)](sql/04_triggers_and_procedures.sql)
-[![Tests](https://img.shields.io/badge/Pruebas-19_Aserciones_SQL-success?style=flat)](sql/05_tests_business_logic.sql)
+[![Tests](https://img.shields.io/badge/Pruebas-219_Python_·_19_SQL-success?style=flat)](tests/)
+[![Forecast](https://img.shields.io/badge/Pron%C3%B3stico-WAPE_23%25_·_intervalo_80%25_calibrado-blueviolet?style=flat)](#9-pronóstico-de-demanda-y-reposición)
 [![Power BI](https://img.shields.io/badge/BI-Star_Schema_%26_DAX-F2C811?style=flat&logo=powerbi&logoColor=black)](bi/dax_measures.md)
 
 Una plataforma integral de ingeniería de datos — infraestructura contenerizada, simulación y generación de datos sintéticos, pipeline ETL con compuerta de calidad estricta (quality gate), lógica transaccional de negocio en PostgreSQL 15, consultas SQL analíticas avanzadas y un datamart optimizado para Business Intelligence — diseñada para resolver el problema crítico del vencimiento de perecibles, descuadres de guías de remisión y fallas en la rotación FEFO/PEPS en tiendas de conveniencia y retail de alta frecuencia.
 
+Además de la base relacional y su lógica transaccional, la plataforma incluye un **almacén dimensional con carga incremental y SCD tipo 2**, un **orquestador de pipeline con reintentos y aislamiento de fallas**, **pronóstico de demanda con evaluación fuera de muestra**, una **proyección FEFO hacia adelante** que lista los lotes que se vencerán antes de que ocurra, un **experimento que mide** si reponer con pronóstico reduce la merma, y una **calidad de datos puntuada contra una verdad de terreno** y versionada en git.
+
 > **Hallazgo principal del dataset simulado de 60 días:** El 75.4% de todas las pérdidas monetarias corresponde a **mermas por vencimiento** — la categoría exacta de pérdida que una regla determinista de rotación FEFO puede mitigar estructuralmente. Análisis completo en [`docs/business_case_study.md`](docs/business_case_study.md).
+>
+> **Hallazgo del experimento de reposición (100 corridas no vistas):** reponer con pronóstico reduce la merma por vencimiento **53%**, pero la utilidad neta mejora solo **0.4%**, porque pedir menos genera más quiebres. Y una política más magra *sin* estacionalidad **pierde dinero**. Detalle en la [sección 10](#10-experimento-reducir-la-merma-compensa-los-quiebres).
 
 ---
 
@@ -26,20 +31,28 @@ docker compose up -d
 
 Ese comando inicia PostgreSQL 15 y, en su primer arranque, aplica automáticamente el DDL en 3NF, los datos maestros (seed), los procedimientos almacenados, los triggers antifraude y el datamart materializado — en su estricto orden de dependencias.
 
-Luego, ejecuta las capas de datos mediante el automatizador:
+Luego, ejecuta todo el pipeline con un solo comando:
 
 ```bash
-make all
+make pipeline
 ```
 
-El cual equivale paso a paso a:
+El orquestador corre seis etapas en orden de dependencia, con reintentos para fallas transitorias y un registro de cada corrida (ver [sección 11](#11-orquestación-y-observabilidad)). Cada etapa puede ejecutarse por separado:
 
 ```bash
-make init-db      # 1. Inicia PostgreSQL y verifica que cada objeto haya sido creado
-make generate     # 2. Simula 60 días de operaciones -> data/raw/*.csv
-make run-etl      # 3. Extrae -> Valida 22 reglas de calidad -> Upsert en PostgreSQL
-make run-queries  # 4. Ejecuta las 4 consultas analíticas avanzadas
+make init-db      # Inicia PostgreSQL y verifica que cada objeto haya sido creado
+make generate     # Simula 60 días de operaciones -> data/raw/*.csv + _manifest.json
+make validate     # Compuerta de calidad (23 reglas), sin base de datos
+make run-etl      # Extrae -> valida -> cuarentena -> UPSERT en PostgreSQL
+make models       # Construye el esquema en estrella (incremental, SCD2) y lo prueba
+make forecast     # Pronostica demanda, proyecta vencimientos, recomienda pedidos
+make dq-report    # Renderiza docs/data_quality_report.md
+make experiment   # Reproduce el experimento de políticas de reposición (~15 s)
+make run-queries  # Ejecuta las 4 consultas analíticas avanzadas
+make test         # 219 pruebas Python + 19 aserciones SQL
 ```
+
+Todo desde cero: `make all`.
 
 ### En Windows (PowerShell nativo sin `make`)
 
@@ -47,17 +60,18 @@ make run-queries  # 4. Ejecuta las 4 consultas analíticas avanzadas
 .\scripts\run_project.ps1 all
 ```
 
-El script de PowerShell expone las mismas acciones (`init-db`, `generate`, `run-etl`, `run-queries`, `validate`, `test`, `status`, `psql`, `logs`, `destroy`). Ejecuta `.\scripts\run_project.ps1 help` para ver la lista completa.
+El script de PowerShell expone las mismas acciones (`init-db`, `pipeline`, `generate`, `validate`, `run-etl`, `models`, `forecast`, `dq-report`, `experiment`, `run-queries`, `test`, `test-unit`, `test-sql`, `status`, `psql`, `logs`, `destroy`). Ejecuta `.\scripts\run_project.ps1 help` para ver la lista completa.
 
 ### Requisitos Previos
 
 | Requisito | Necesario para |
 |---|---|
 | Docker Desktop | Servicio de base de datos PostgreSQL 15 |
-| Python 3.9+ | Generador de datos y pipeline ETL |
-| `pip install -r requirements.txt` | pandas · SQLAlchemy 2.x · psycopg2-binary |
+| Python 3.9+ | Generador, ETL, modelos, pronóstico y orquestador |
+| `pip install -r requirements.txt` | pandas · numpy · SQLAlchemy 2.x · psycopg2-binary |
+| `pip install -r requirements-dev.txt` | Lo anterior + pytest, para ejecutar las pruebas |
 
-*Nota: No se requiere base de datos activa para probar el motor de calidad de datos — `make validate` (o `.\scripts\run_project.ps1 validate`) ejecuta la extracción y evalúa las 22 reglas contra los CSVs generando el registro de auditoría sin necesidad de conexión.*
+*Nota: No se requiere base de datos activa para probar el motor de calidad de datos — `make validate` (o `.\scripts\run_project.ps1 validate`) ejecuta la extracción y evalúa las 23 reglas contra los CSVs generando el registro de auditoría sin necesidad de conexión. El generador, el experimento de políticas y el módulo de calidad usan solo la librería estándar.*
 
 ### Parámetros de Conexión
 
@@ -78,35 +92,48 @@ Puedes sobreescribir cualquiera de estos valores con un archivo `.env` (ver [`.e
 retail-inventory-analytics-3nf/
 │
 ├── docker-compose.yml              # PostgreSQL 15 + pgAdmin opcional; scripts de inicio ordenados
-├── Makefile                        # Automatizador de tareas: init-db, run-etl, run-queries, test
-├── requirements.txt                # pandas, SQLAlchemy 2.x, psycopg2-binary
-├── .env.example                    # Plantilla de variables de entorno (credenciales, DSN, parámetros)
+├── Makefile                        # Automatizador: pipeline, models, forecast, test, ...
+├── requirements.txt / -dev.txt     # Dependencias de ejecución / de pruebas
+├── .github/workflows/ci.yml        # CI: unitarias, integración con PostgreSQL real, Compose
 │
 ├── sql/
 │   ├── 01_schema_ddl_3nf.sql       # Esquema 3NF de 10 tablas, restricciones CHECK, índices parciales
-│   ├── 02_seed_data.sql            # Datos maestros de referencia (tiendas, proveedores, SKUs, mermas)
-│   ├── 03_analytical_queries.sql   # 4 consultas analíticas: CTEs + funciones de ventana (Window Functions)
+│   ├── 02_seed_data.sql            # Datos maestros de referencia
+│   ├── 03_analytical_queries.sql   # 4 consultas analíticas: CTEs + funciones de ventana
 │   ├── 04_triggers_and_procedures.sql  # Procedimiento FEFO, trigger antifraude, datamart materializado
-│   └── 05_tests_business_logic.sql # 19 aserciones SQL; aisladas en SAVEPOINT, no destructivas
+│   ├── 05_tests_business_logic.sql # 19 aserciones SQL en una transacción que termina en ROLLBACK
+│   ├── 06_ops_schema.sql           # Esquema ops: corridas, tareas, modelos, resultados de calidad
+│   ├── 07_ml_schema.sql            # Esquema ml: pronósticos, backtest, reposición, lotes por vencer
+│   └── models/                     # Esquema en estrella (mart.*): 5 dimensiones, 4 hechos, vistas, pruebas
 │
 ├── src/
-│   ├── data_generator.py           # Motor de simulación de inventario -> CSV (solo librería estándar)
-│   └── etl_pipeline.py             # Extracción -> 22 reglas de calidad -> UPSERT por bloques -> auditoría
+│   ├── data_generator.py           # Simulación de inventario; 3 políticas de reposición (stdlib)
+│   ├── etl_pipeline.py             # Extracción -> 23 reglas -> UPSERT idempotente -> auditoría
+│   ├── dq.py / dq_report.py        # Catálogo de reglas, puntuación vs verdad de terreno, reporte
+│   ├── model_runner.py             # Construye y prueba los modelos SQL (dependencias, incremental)
+│   ├── forecasting.py              # 5 modelos, backtest de origen móvil, proyección FEFO, pedidos
+│   ├── policy_experiment.py        # ¿Reponer con pronóstico reduce la merma? (stdlib)
+│   ├── pipeline.py                 # Orquestador: DAG, reintentos, aislamiento de fallas
+│   └── dbutil.py                   # Conexión compartida
+│
+├── tests/                          # 219 pruebas: 187 unitarias, 32 contra PostgreSQL real
 │
 ├── data/
-│   ├── raw/                        # Datasets CSV generados (ignorados en git, reproducibles)
-│   └── quarantine/                 # Filas rechazadas por el quality gate, etiquetadas con la regla fallida
+│   ├── raw/                        # CSVs generados + _manifest.json (git-ignorados, reproducibles)
+│   └── quarantine/                 # Filas rechazadas por el quality gate, con la regla fallida
 │
 ├── docs/
-│   ├── architecture_spec.md        # Especificación técnica del modelo relacional
-│   ├── business_case_study.md      # Caso ejecutivo de negocio: KPIs, composición de mermas, modelo de ROI
-│   └── etl_execution.log           # Bitácora de auditoría de ejecución ETL (generada automáticamente)
+│   ├── architecture_spec.md        # Especificación técnica de todas las capas
+│   ├── business_case_study.md      # Caso de negocio: KPIs, composición de mermas, ROI, evidencia experimental
+│   ├── data_quality_report.md      # Reporte de calidad generado desde datos (versionado)
+│   ├── data_quality/history.jsonl  # Una línea por corrida de calidad: la tendencia (versionado)
+│   └── experiments/                # Informe del experimento de políticas + gráfica de frontera
 │
 ├── bi/
-│   └── dax_measures.md             # Esquema en estrella y fórmulas de medidas DAX para Power BI
+│   └── dax_measures.md             # Esquema en estrella y medidas DAX para Power BI
 │
 └── scripts/
-    └── run_project.ps1             # Automatizador nativo para Windows PowerShell (equivalente a Makefile)
+    └── run_project.ps1             # Automatizador nativo para Windows (equivalente a Makefile)
 ```
 
 ---
@@ -226,8 +253,10 @@ La Consulta 1 representa el núcleo operativo: reporta el **capital actualmente 
 ## 6. Generador de Datos Sintéticos — `src/data_generator.py`
 
 ```bash
-python src/data_generator.py --days 60 --seed 20261012
+python src/data_generator.py --days 60 --seed 20261012 --end-date 2026-10-11
 ```
+
+> **Fije `--end-date` para reproducir las cifras de este documento.** Sin él, el generador simula los 60 días hasta *ayer*, de modo que cambia todos los días. Las cifras citadas aquí corresponden a la ventana que termina el 2026-10-11. Con `make`: `make generate SIM_END=2026-10-11`.
 
 Sin dependencias externas — desarrollado exclusivamente con la librería estándar de Python. Características que hacen que la simulación sea realista:
 
@@ -247,7 +276,9 @@ La curva térmica anual de Lima (15–27 °C) modula la elasticidad de bebidas y
 
 **3. Mermas orgánicas derivadas de la simulación:** La merma por vencimiento surge de lo que la rotación FEFO no logró vender a tiempo — nunca de valores fijos arbitrarios. Daños físicos, fallas de frío y pérdidas desconocidas se inyectan como incidentes operativos estocásticos.
 
-**4. Inyección deliberada de anomalías de calidad:** Se incluyen registros anómalos de manera controlada para someter a prueba la compuerta de validación ETL; el recuento exacto se detalla en el reporte final.
+**4. Inyección deliberada de anomalías, con verdad de terreno:** Se plantan defectos de manera controlada para someter a prueba la compuerta ETL, y `_manifest.json` registra la clave natural de **cada uno**. Así el *recall* de la compuerta se mide fila a fila en lugar de afirmarse (ver [sección 12](#12-calidad-de-datos-versionada)). Un faltante "no documentado" lo es de verdad: no lleva nota. Antes, el texto de la nota lo delataba, lo que habría entregado la respuesta a cualquier regla.
+
+**5. Tres políticas de reposición** (`--policy heuristic|level|forecast`): la heurística estática heredada, un nivel estadístico sin estacionalidad y un nivel basado en pronóstico semanal. Las dos últimas aprenden **solo de las ventas ya observadas**, corrigiendo la censura por quiebres. La política `heuristic` reproduce byte a byte la línea base original (verificado).
 
 | Archivo Generado | Registros (60 días) |
 |---|---:|
@@ -278,16 +309,16 @@ data/raw/*.csv
 [ TRANSFORMACIÓN ] Resolución de claves naturales, columnas derivadas, deduplicación
      │
      ▼
-[ CALIDAD DE DATOS] 22 reglas × 4 severidades — FATAL aborta, ERROR envía a cuarentena
+[ CALIDAD DE DATOS] 23 reglas × 4 severidades — FATAL aborta, ERROR envía a cuarentena
      │
      ▼
 [ CARGA ]          UPSERT por bloques, una transacción por tabla en orden de FKs
      │
      ▼
-[ AUDITORÍA ]      docs/etl_execution.log + data/quarantine/*.csv
+[ AUDITORÍA ]      docs/etl_execution.log + data/quarantine/*.csv + registro de calidad (ops.dq_*)
 ```
 
-### Batería de 22 Reglas de Calidad
+### Batería de 23 Reglas de Calidad
 
 | Regla | Severidad | Validación Realizada |
 |---|---|---|
@@ -296,6 +327,7 @@ data/raw/*.csv
 | `R01`–`R03` | ERROR | Cantidad despachada no positiva, **cantidad recibida negativa**, sobre-recepción |
 | `R04` | WARNING | **Descuadre entre guía de remisión y conteo físico** (merma de proveedor) |
 | `R05` | WARNING | Temperatura de frío fuera del rango operativo admisible (−25 °C a 85 °C) |
+| `R06` | WARNING | **Faltante contra la guía SIN motivo documentado** — separa un rechazo explicado de un faltante que nadie justificó |
 | `B01` | ERROR | **`expiration_date` anterior a `manufacturing_date`** (fecha de caducidad ilógica) |
 | `B02`–`B04` | ERROR | `initial_qty` no positivo, existencia negativa, balance de masa inconsistente |
 | `B05` | WARNING | Vida útil observada difiere del maestro de SKUs (posible error de rotulado) |
@@ -310,7 +342,8 @@ data/raw/*.csv
 
 ### Propiedades de Ingeniería del Pipeline
 
-- **Idempotencia:** Toda carga ejecuta `INSERT ... ON CONFLICT DO UPDATE` sobre la clave natural, permitiendo reejecuciones seguras sin duplicidad de datos.
+- **Idempotencia verificada:** Toda carga es un upsert sobre la clave natural. Una versión previa cargaba `goods_receipt_items` con `DELETE` + `INSERT`, lo que viola la FK `inventory_batches.grn_item_id` en la *segunda* corrida; la transacción se revertía y los conteos coincidían, así que *parecía* idempotente. La prueba que lo protege compara sumas de verificación de **contenido** tras ejecutar el pipeline completo dos veces.
+- **Cada regla registra filas evaluadas y fallidas, incluso las que no encontraron nada:** "0 hallazgos" no distinguía un dataset limpio de una regla que nunca corrió.
 - **Claves Naturales en lugar de SERIALs:** Los CSVs transportan `store_code`, `sku_code`, `grn_number`; las claves subrogadas se resuelven contra la base de datos viva tras cargar cada nivel de dependencia — asegurando compatibilidad con datos precargados.
 - **Cuarentena en lugar de coerción silenciosa:** Ninguna fila que viole una regla de nivel ERROR es forzada o alterada en la base de datos. Se redirige a `data/quarantine/` etiquetada con la regla infringida para su subsanación en origen.
 - **Tipado seguro:** La ingesta inicial se realiza como texto (`str`) y se procesa columna por columna con `errors="coerce"`, convirtiendo errores en nulos detectables en lugar de alterar tipos de datos de forma inadvertida.
@@ -318,30 +351,189 @@ data/raw/*.csv
 
 ### Salida Ejemplo de Auditoría
 
+Ventana que termina el 2026-10-11 (`--end-date 2026-10-11`):
+
 ```
-PHASE 2/5 -- TRANSFORM & QUALITY CHECKS
 [ERROR  ] R02 | goods_receipts.csv |      2 row(s) | Cantidad recibida negativa: conteo físico imposible
 [WARNING] R04 | goods_receipts.csv |    105 row(s) | Descuadre entre guía y conteo físico (483.00 unidades faltantes)
+[WARNING] R06 | goods_receipts.csv |      6 row(s) | Faltante contra la guía SIN motivo documentado
 [ERROR  ] B01 | batches.csv        |      2 row(s) | expiration_date es anterior a manufacturing_date
 [ERROR  ] W03 | waste_log.csv      |      3 row(s) | Merma superior a S/ 50.00 sin usuario autorizador
-[WARNING] F01 | waste_log.csv      |      1 row(s) | Referencia huérfana: batch_code no coincide con ningún lote activo
+[WARNING] F01 | waste_log.csv      |      1 row(s) | Referencia huérfana: batch_code no coincide con ningún lote
 
 ETL EXECUTION SUMMARY
-  Filas extraídas   : 6,863 a lo largo de 9 datasets
-  Filas en cuarentena: 7
-  Tasa de aceptación: 99.898%
-  Hallazgos         : 0 FATAL | 3 ERROR | 2 WARNING | 0 INFO
+  rows extracted    : 6,863 across 9 dataset(s)
+  rows quarantined  : 7
+  acceptance rate   : 99.898%
+```
+
+Nótese la cascada en la última fila: un lote enviado a cuarentena por `B01` dejó una merma que apunta a un lote que ya no existe, y `F01` la detectó. Las reglas se componen.
+
+---
+
+## 8. Modelo Dimensional con Carga Incremental — `sql/models/`
+
+```bash
+make models
+```
+
+Un ejecutor propio (`src/model_runner.py`, sin dependencias) con la parte de dbt que importa a este tamaño: **orden de construcción, carga incremental y pruebas tras cada construcción**.
+
+| Tipo | Modelos | Estrategia |
+|---|---|---|
+| `table` | `dim_date`, `dim_store`, `dim_supplier`, `dim_waste_reason` | Upsert completo |
+| `scd2` | `dim_product` | Cada cambio de costo, precio o vida útil abre una versión nueva |
+| `incremental` | `fact_sales_daily`, `fact_waste`, `fact_receipt_line` | Reprocesa desde (marca de agua − `lookback`) y hace upsert |
+| `snapshot` | `fact_stock_position` | Una instantánea por corrida; nunca se trunca |
+| `view` | `mart_views` | `v_store_day_kpi`, `v_supplier_scorecard`, `v_weekday_demand_profile`, `v_fefo_exposure_latest` |
+
+- **SCD tipo 2 con consulta punto-en-el-tiempo.** Un hecho se valora con la versión del producto vigente *el día en que ocurrió*. Con tipo 1, reprecificar un SKU reescribiría en silencio el margen de toda venta pasada.
+- **Ventana de retroceso.** Un incremental estricto nunca vería datos tardíos o corregidos del POS. Se reprocesan los últimos 3 días. En una re-ejecución real `fact_sales_daily` reprocesó **240 de 3,579 filas**. El costo está documentado y probado: un cambio más antiguo que la ventana no se recoge hasta `--full-refresh`.
+- **La instantánea es la única forma de tener historia de stock**: `inventory_batches` solo guarda la cantidad *actual*, así que el stock de ayer no puede reconstruirse.
+- **13 pruebas de modelo**, cada una una consulta que devuelve las filas que *violan* una expectativa (cero filas = aprobado). La mayoría son **conciliaciones al centavo** contra el origen 3NF, lo que prueba que ni el incremental, ni el join SCD2, ni el mapeo de claves perdieron o duplicaron filas.
+
+Detalle de diseño en [`docs/architecture_spec.md`](docs/architecture_spec.md) §11.
+
+---
+
+## 9. Pronóstico de Demanda y Reposición
+
+```bash
+make forecast
+```
+
+Pronostica 14 días por tienda × SKU con **cinco modelos** (`seasonal_naive`, `moving_average`, `weekday_mean`, `holt_winters` amortiguado, `ensemble`), proyecta qué lotes se vencerán sin venderse y recomienda pedidos. Todo se persiste en `ml.*` con fecha de generación, de modo que un pronóstico nunca se pisa con el siguiente.
+
+**Evaluación que no se engaña a sí misma** (60 series, ventanas que ni la elección del modelo ni la calibración vieron):
+
+| Modelo | WAPE |
+|---|---:|
+| `seasonal_naive` (la vara a superar) | 30.0% |
+| `moving_average` | 36.0% |
+| `holt_winters` | 23.5% |
+| `weekday_mean` | 23.4% |
+| **`ensemble` (el que se despliega)** | **23.1%** |
+| Mejor modelo elegido *por serie* | 24.1% |
+
+- **Elegir el mejor modelo por serie empeora el resultado** (24.1% vs 23.1%): con dos ventanas por serie, escoger entre cinco se sobreajusta al ruido. Por eso el valor por defecto es el `ensemble` fijo. *Salvedad:* ese valor por defecto se fijó viendo estos números, así que 23.1% es ligeramente optimista.
+- **El intervalo "al 80%" cubría solo 66%.** Calibrar con 14 residuos por serie subestima la dispersión; calibrar con residuos relativos agrupados entre series lo lleva a **80.4%**.
+
+Ejemplo real, empanada en TB-101 (patrón semanal capturado; intervalo 80%):
+
+| Dom | Lun | Mar | Mié | Jue | **Vie** | **Sáb** |
+|---:|---:|---:|---:|---:|---:|---:|
+| 68 (46–95) | 36 (24–50) | 31 (21–43) | 30 (20–42) | 28 (19–39) | **81** (55–114) | **87** (59–123) |
+
+**Proyección FEFO hacia adelante.** Consume los lotes en mano contra el pronóstico en estricto orden de vencimiento y reporta cuáles terminarán en merma: la lista de qué rebajar *hoy*, mientras aún tiene valor. FEFO la hace independiente de entregas futuras, y un lote que vence más allá del horizonte reporta cero pérdida porque el pronóstico no ve tan lejos (ausencia de pérdida proyectada no es evidencia de que no la habrá).
+
+*Limitación conocida:* el historial es de **ventas**, no de demanda. Un día de quiebre subestima lo que los clientes querían y el modelo aprende esa subestimación.
+
+---
+
+## 10. Experimento: ¿Reducir la Merma Compensa los Quiebres?
+
+```bash
+make experiment
+```
+
+El caso de negocio supone que reponer mejor recupera entre 25% y 45% de la merma por vencimiento. `src/policy_experiment.py` lo **mide**: tres políticas sobre el mismo simulador, con el nivel de servicio elegido en 20 semillas de entrenamiento y evaluado en **100 semillas distintas**.
+
+| Política (media de 100 corridas de 60 días) | Utilidad neta | Merma | de la cual vencimiento | Ventas perdidas |
+|---|---:|---:|---:|---:|
+| Heurística actual | S/ 178,105 | S/ 2,343 | S/ 1,778 | S/ 3,729 |
+| Nivel plano (sin estacionalidad) | S/ 177,294 | S/ 1,508 | S/ 1,001 | S/ 7,774 |
+| **Pronóstico estacional** | **S/ 178,756** | **S/ 1,381** | **S/ 836** | S/ 4,874 |
+
+Diferencias pareadas por semilla, IC 95% bootstrap:
+
+| Comparación | Utilidad neta | Lectura |
+|---|---:|---|
+| Pronóstico vs. heurística | **+S/ 651** [+358, +952] | Mejor, significativo |
+| Nivel plano vs. heurística | −S/ 811 [−1,110, −504] | **Peor**, significativo |
+| Pronóstico vs. nivel plano | +S/ 1,462 [+1,209, +1,714] | El valor está en el pronóstico |
+
+1. **La merma por vencimiento baja 53%, pero la utilidad neta sube 0.4%.** Solo el 67.7% del ahorro bruto de merma sobrevive como utilidad neta; el resto se pierde en ventas no realizadas.
+2. **Bajar el stock sin estacionalidad pierde dinero.** El nivel plano existe precisamente para separar el valor del *pronóstico* del valor de *dimensionar mejor*.
+3. **A escala de 400 tiendas** equivale a ≈ **S/ 396 mil al año** (IC 95%: S/ 218 mil – S/ 579 mil): entre el escenario conservador y el base del caso de negocio.
+
+![Frontera merma vs. ventas perdidas](docs/experiments/policy_frontier.svg)
+
+**Limitaciones, sin maquillar:** la demanda simulada es fuertemente semanal *por construcción* (un pronóstico por día de la semana está hecho para encontrar esa señal); la heurística conoce la tasa base real y las políticas aprendidas no; y la utilidad neta omite costo de inventario y pérdida de clientes. Las dos primeras versiones del experimento estaban mal especificadas (cobertura `intervalo + 1` heredada; descartar los días de quiebre sesgaba la demanda a la baja) y se documentan en el [informe completo](docs/experiments/policy_comparison.md).
+
+---
+
+## 11. Orquestación y Observabilidad
+
+```bash
+make pipeline
+```
+
+```
+bootstrap --+
+            +--> etl --+--> models --> forecast
+generate ---+          |
+                       +--> dq_report
+```
+
+Corrida real (7.4 s):
+
+```
+[1/6] bootstrap   SUCCESS      0.3s
+[2/6] generate    SUCCESS      0.1s
+[3/6] etl         SUCCESS      5.1s      defects_caught: 12/12
+[4/6] dq_report   SUCCESS      0.0s
+[5/6] models      SUCCESS      0.3s      tests_passed: 13/13
+[6/6] forecast    SUCCESS      1.6s      holdout_wape: 0.2314, interval_coverage: 0.8036
+```
+
+- **Dependencias, no una lista fija.** Si `etl` falla, `models` y `forecast` se **omiten** (pronosticar sobre un almacén a medio cargar es peor que no pronosticar); lo que no depende de la falla sigue corriendo. Una tarea omitida nombra la **causa raíz** (`upstream failed: etl`), no su vecino omitido.
+- **Reintentos solo donde ayudan.** Una conexión rechazada o un *timeout* se reintentan con retroceso exponencial. Una compuerta de calidad o una prueba fallida **no**: volver a correr falla igual y ocultaría el problema.
+- **Ejecución parcial:** `--from models`, `--only forecast`, `--skip generate`.
+- **Cada corrida queda registrada** en `ops.pipeline_runs` y `ops.task_runs`:
+
+```sql
+SELECT * FROM ops.v_run_history;   -- ¿funcionó la carga de anoche?
+SELECT * FROM ops.v_dq_trend;      -- ¿qué tan limpios venían los datos?
 ```
 
 ---
 
-## 8. Suite de Pruebas de Regresión — `sql/05`
+## 12. Calidad de Datos Versionada
 
 ```bash
-make test
+make dq-report      # genera docs/data_quality_report.md
 ```
 
-19 aserciones SQL que validan el comportamiento crítico de negocio. Cada prueba corre dentro de un bloque `SAVEPOINT` que se revierte (`ROLLBACK TO SAVEPOINT`), haciendo la suite **completamente idempotente y no destructiva** — segura de ejecutar en entornos con datos reales.
+El reporte [`docs/data_quality_report.md`](docs/data_quality_report.md) se genera desde datos —nunca a mano— y cita la corrida que lo produjo. Cada ejecución agrega una línea a [`docs/data_quality/history.jsonl`](docs/data_quality/history.jsonl), por lo que la calidad tiene una tendencia bajo control de versiones.
+
+- **Reglas clasificadas por dimensión** (completitud, unicidad, validez, consistencia, integridad, oportunidad) y agregadas en un cuadro de mando.
+- **Puntuación contra la verdad de terreno.** El generador registra cada defecto que plantó; compararlo fila a fila mide el *recall* en lugar de asumirlo. Un defecto cuenta como detectado solo si *esa fila* fue marcada por *la regla responsable*:
+
+| Defecto plantado | Regla | Plantados | Detectados |
+|---|---|---:|---:|
+| `expiry_before_manufacturing` | `B01` | 2 | 2 |
+| `negative_received_qty` | `R02` | 2 | 2 |
+| `guide_vs_count_discrepancy` | `R06` | 6 | 6 |
+| `unauthorized_high_waste` | `W03` | 2 | 2 |
+
+**65 de 65 defectos detectados a lo largo de 6 conjuntos de datos independientes** (semillas distintas).
+
+- **Alcance honesto:** el *recall* se mide contra los defectos que alguien pensó en inyectar. Dice poco sobre los que nadie imaginó; con datos reales no hay lista contra la cual puntuar.
+- **El `git_sha` lleva el sufijo `+dirty`** si hay cambios sin commitear: un hash desnudo afirmaría que *ese* commit produjo el resultado.
+
+---
+
+## 13. Pruebas — 219 Python y 19 SQL
+
+```bash
+make test          # Python, luego SQL
+make test-unit     # solo Python (las de integración se omiten si no hay PostgreSQL)
+make test-sql      # solo las 19 aserciones SQL
+```
+
+### Suite SQL — `sql/05` (19 aserciones)
+
+Valida el comportamiento crítico de negocio. Toda la suite corre en **una sola transacción** que termina en `ROLLBACK`, haciéndola idempotente y no destructiva — segura de ejecutar en entornos con datos reales. Cada prueba empieza reconstruyendo su fixture con `pg_temp.reset_fixture()`.
 
 | Grupo | Comportamiento Validado |
 |---|---|
@@ -350,13 +542,42 @@ make test
 | **T3 — Antifraude** | Se bloquea merma material no autorizada; se acepta y valoriza merma debidamente visada; mermas menores a S/ 50 no exigen firma; se bloquea la auto-autorización |
 | **T4 — Barrido y Datamart** | El barrido nocturno reclasifica y da de baja existencias vencidas; la vista materializada existe, tiene clave única y carece de duplicados |
 
-Los fixtures utilizan códigos con prefijo `TEST-` para evitar colisiones con datos operativos, y los lotes de prueba se insertan en **orden cronológico inverso** para forzar a que el procedimiento ordene por FEFO por lógica propia y no por el orden físico de inserción.
+> **Un bug del propio arnés, encontrado al ejecutarlo contra una base real.** La primera versión aislaba cada prueba con `SAVEPOINT` + `ROLLBACK TO SAVEPOINT`, pero ese rollback también revierte los `INSERT` de cada aserción en la tabla de resultados: el resumen decía **3 de 3** cuando se habían ejecutado 19. Las aserciones sí corrían (un fallo lanza una excepción), pero el resumen mentía.
+
+Los lotes de prueba se insertan en **orden cronológico inverso** para forzar a que el procedimiento ordene por FEFO por lógica propia y no por el orden físico de inserción.
+
+### Suite Python — `tests/` (219 pruebas)
+
+187 unitarias y 32 de integración. Cada prueba de integración crea **una base de datos temporal** desde los archivos SQL reales y la destruye al terminar; si PostgreSQL no está, se *omiten* en lugar de fallar.
+
+| Archivo | Pruebas | Qué demuestra |
+|---|---:|---|
+| `test_forecasting.py` | 56 | Modelos contra series de estructura conocida; **sin look-ahead**; calibración; proyección FEFO |
+| `test_pipeline.py` | 35 | Orden del grafo, aislamiento de fallas, reintentos solo transitorios |
+| `test_dq.py` | 28 | Catálogo de reglas, puntuación contra verdad de terreno |
+| `test_generator.py` | 25 | Determinismo, línea base intacta, la verdad de terreno no miente |
+| `test_etl_gate.py` | 24 | Cada regla con una fila que debe fallar y otra que no |
+| `test_model_runner_unit.py` | 19 | Cabeceras, dependencias, ciclos |
+| `test_pipeline_integration.py` | 18 | **El pipeline real dos veces**, con una falla inyectada |
+| `test_models_integration.py` | 14 | Incremental, SCD2, instantáneas, idempotencia |
+
+### Prueba de mutación
+
+Que pasen no demuestra que sirvan. Se introdujeron cinco defectos a propósito y se verificó que la prueba responsable fallara (archivos restaurados y verificados por hash): **5 de 5 detectados.**
+
+| Defecto introducido | Lo detecta |
+|---|---|
+| La carga de recepciones vuelve a `DELETE` + `INSERT` | Ejecutar el pipeline completo dos veces |
+| El backtest filtra un día del futuro | Prueba de no-look-ahead |
+| Los hechos se unen a la versión *actual* del producto | Prueba SCD2 punto-en-el-tiempo |
+| `R06` deja de marcar faltantes sin motivo | Puntuación contra la verdad de terreno |
+| Se desactiva la calibración de intervalos | Prueba de cobertura |
 
 ---
 
-## 9. Inteligencia de Negocios (Power BI)
+## 14. Inteligencia de Negocios (Power BI)
 
-El modelo dimensional proyecta las tablas transaccionales hacia un esquema en estrella para reportes ejecutivos. Especificación completa de medidas DAX en [`bi/dax_measures.md`](bi/dax_measures.md).
+El modelo dimensional proyecta las tablas transaccionales hacia un esquema en estrella para reportes ejecutivos. El esquema **ya no es solo documentación**: se implementa y se prueba en `sql/models/` ([sección 8](#8-modelo-dimensional-con-carga-incremental--sqlmodels)). Especificación completa de medidas DAX en [`bi/dax_measures.md`](bi/dax_measures.md).
 
 | KPI | Fórmula / Definición |
 |---|---|
@@ -370,9 +591,9 @@ Power BI se conecta directamente a `mv_store_category_waste_summary` en lugar de
 
 ---
 
-## 10. Impacto y Resultados de Negocio
+## 15. Impacto y Resultados de Negocio
 
-Resultados medidos sobre el dataset simulado de 60 días para 4 tiendas:
+Resultados medidos sobre el dataset simulado de 60 días para 4 tiendas (`--end-date 2026-10-11`, **una sola realización**: la merma por vencimiento de esta semilla es 23% mayor que el promedio de 100 semillas):
 
 | Métrica de Negocio | Valor Obtenido |
 |---|---:|
@@ -389,11 +610,13 @@ Resultados medidos sobre el dataset simulado de 60 días para 4 tiendas:
 * **Periodo de Recuperación:** **12.8 meses**
 * **Retorno sobre la Inversión (ROI a 3 años):** **109%**
 
-Cada cifra cuenta con su etiqueta metodológica (MEDIDO, BENCHMARK o SUPUESTO), acompañada de análisis de sensibilidad y limitaciones en [`docs/business_case_study.md`](docs/business_case_study.md).
+Esa proyección descansa en tasas de recuperación **supuestas**. El experimento de la [sección 10](#10-experimento-reducir-la-merma-compensa-los-quiebres) las contrasta: el beneficio neto medido de la palanca de reposición (≈ S/ 396 mil al año a 400 tiendas) queda entre el escenario conservador y el base, lo que respalda el supuesto sin demostrarlo sobre datos reales.
+
+Cada cifra cuenta con su etiqueta metodológica (MEDIDO, EXPERIMENTO, BENCHMARK o SUPUESTO), acompañada de análisis de sensibilidad y limitaciones en [`docs/business_case_study.md`](docs/business_case_study.md).
 
 ---
 
-## 11. Stack Tecnológico
+## 16. Stack Tecnológico
 
 | Capa | Tecnología Empleada |
 |---|---|
@@ -401,14 +624,18 @@ Cada cifra cuenta con su etiqueta metodológica (MEDIDO, BENCHMARK o SUPUESTO), 
 | **Lógica Transaccional** | PL/pgSQL — Stored procedures, triggers `BEFORE`, bloqueo concurrente de filas (`FOR UPDATE`) |
 | **Generación de Datos** | Python 3.9+ (librería estándar) — Simulación determinista de inventario y demanda retail |
 | **Pipeline ETL** | Python · pandas · SQLAlchemy 2.x · psycopg2 |
+| **Almacén dimensional** | SQL puro: SCD tipo 2, cargas incrementales con ventana de retroceso, instantáneas periódicas, ejecutor propio con orden topológico |
+| **Pronóstico** | numpy · Holt-Winters amortiguado, backtest de origen móvil, intervalos calibrados, proyección FEFO |
+| **Orquestación** | Python estándar — DAG, reintentos con retroceso exponencial, aislamiento de fallas, registro en `ops.*` |
 | **Infraestructura** | Docker Compose — Scripts de inicio ordenados, healthchecks y volúmenes persistentes |
 | **Automatización** | GNU Make · PowerShell nativo para Windows |
-| **Pruebas y Validación** | Aserciones SQL en transacciones aisladas (`SAVEPOINT`) |
+| **Pruebas y Validación** | 219 pruebas pytest (32 contra PostgreSQL real con base temporal por prueba) · 19 aserciones SQL · prueba de mutación |
+| **Integración Continua** | GitHub Actions: unitarias, servicio PostgreSQL 15, validación de Compose |
 | **Inteligencia de Negocios** | Power BI — Esquema en estrella, modelado dimensional, DAX avanzado |
 
 ---
 
-## 12. Autor
+## 17. Autor
 
 **Odar Javier Alcocer Vásquez**  
 *Estudiante de Ingeniería de Sistemas de Información — Universidad Peruana de Ciencias Aplicadas (UPC)*  

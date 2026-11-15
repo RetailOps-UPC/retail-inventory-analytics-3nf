@@ -15,6 +15,24 @@ Este documento contiene las fórmulas analíticas en DAX modeladas para el **Tab
   - `Dim_Store`: Código de tienda, formato (Convenience, Express, Flagship), distrito y estado operativo.
   - `Dim_WasteReason`: Clasificación de pérdida (Vencimiento, Daño Físico, Ruptura de Cadena de Frío, Pérdida Desconocida).
 
+### Correspondencia con el esquema implementado
+
+Este esquema ya existe como tablas reales en el esquema `mart` de PostgreSQL (`sql/models/`, construido con `make models`). Las medidas de abajo usan los nombres de modelo de Power BI; al importar, renombra cada tabla según esta correspondencia:
+
+| Nombre en las medidas DAX | Tabla en PostgreSQL | Notas |
+|---|---|---|
+| `Fact_DailySales` | `mart.fact_sales_daily` | Grano tienda × producto × día; `gross_margin` es columna calculada |
+| `Fact_WasteLog` | `mart.fact_waste` | `is_expiry` y `is_authorized` ya vienen derivados |
+| `Fact_InventoryBatches` | `mart.fact_stock_position` | **Instantánea periódica**, no el estado de cada lote: una fila por tienda × producto × día de corrida, con cantidades y valor que vencen en 2 y 5 días |
+| *(nueva)* | `mart.fact_receipt_line` | Despachado vs. conteo físico por línea; alimenta el fill rate y `value_short` (monto reclamable) |
+| `Dim_Date` | `mart.dim_date` | Incluye `is_weekend`, `is_payday_window` y feriados de fecha fija |
+| `Dim_Product` | `mart.dim_product` | **SCD tipo 2**: filtra `is_current` para el catálogo vigente; los hechos ya apuntan a la versión válida el día del evento |
+| `Dim_Store` | `mart.dim_store` | |
+| `Dim_WasteReason` | `mart.dim_waste_reason` | Incluye `is_fefo_addressable` |
+| *(nueva)* | `mart.dim_supplier` | |
+
+Para conectar Power BI sin armar los *joins* a mano hay cuatro vistas listas en `mart`: `v_store_day_kpi`, `v_supplier_scorecard`, `v_weekday_demand_profile` y `v_fefo_exposure_latest`. Las salidas de pronóstico (`ml.demand_forecast`, `ml.replenishment_recommendation`, `ml.v_markdown_worklist`) se unen al esquema por `store_id` y `product_id`.
+
 ---
 
 ## 2. Métricas DAX Financieras y de Volumen

@@ -12,11 +12,14 @@ Este estudio distingue rigurosamente tres categorías de números, identificando
 
 | Etiqueta | Significado |
 |---|---|
-| **MEDIDO** | Calculado directamente a partir del dataset simulado de 60 días en `data/raw/`. Reproducible ejecutando `make generate` con semilla `20261012`. |
+| **MEDIDO** | Calculado directamente a partir del dataset simulado de 60 días en `data/raw/`. Reproducible con `python src/data_generator.py --end-date 2026-10-11` (semilla por defecto `20261012`). La ventana debe fijarse: sin `--end-date` el generador simula los 60 días hasta ayer y las cifras cambian cada día. |
 | **BENCHMARK** | Rangos publicados de la industria de supermercados y tiendas de conveniencia, utilizados para contextualizar el problema. |
+| **EXPERIMENTO** | Medido sobre 100 realizaciones independientes del simulador, con intervalos de confianza. Reproducible con `python src/policy_experiment.py`; informe completo en [`docs/experiments/policy_comparison.md`](experiments/policy_comparison.md). |
 | **SUPUESTO** | Variable o parámetro de modelado para el cálculo del retorno de inversión (ROI). Todo supuesto se declara explícitamente y se evalúa en la tabla de sensibilidad. |
 
 El dataset es una **simulación de una red ya monitoreada y controlada**, por lo que su tasa de merma se sitúa deliberadamente en el extremo eficiente del rango de la industria. El caso de negocio se sustenta en la *composición* de la pérdida —la cual los datos miden con precisión— y no en asumir un escenario inicial artificialmente desastroso.
+
+**Advertencia sobre la línea base:** las cifras MEDIDO de las secciones 3 y 6.1 provienen de **una sola realización** de la simulación (semilla `20261012`). Esa realización resulta **23% más alta que el promedio** en merma por vencimiento: S/ 2,186 frente a S/ 1,778 promedio de 100 semillas (EXPERIMENTO). La *composición* de la pérdida es estable entre semillas; el *monto* absoluto no, y debe leerse como un valor posible, no como el valor esperado.
 
 ---
 
@@ -36,6 +39,8 @@ Esta plataforma ataca los tres problemas con un único núcleo relacional: rotac
 * **Beneficio anual estimado:** **S/ 1.68 Millones**
 * **Periodo de recuperación:** **12.8 meses**
 * **Retorno sobre la Inversión (ROI a 3 años):** **109% en el escenario base** (e incluso un **38%** en el escenario más conservador). Detalle en §6.
+
+> **Matiz medido (§6.4):** al simular la reposición guiada por pronóstico en 100 realizaciones independientes, la merma por vencimiento baja **53%**, pero la utilidad neta mejora solo **0.4%** (≈ S/ 396 mil al año para 400 tiendas, IC 95%: S/ 218 mil – S/ 579 mil), porque pedir menos genera más quiebres de stock. Solo dos tercios del ahorro bruto en merma sobreviven al neto.
 
 ---
 
@@ -138,6 +143,8 @@ Todos los KPIs se implementaron tanto en SQL como en DAX, impidiendo discrepanci
 | **Días de Venta de Inventario (DSI)** | `stock_actual / promedio_diario_ultimos_7_dias` | Consulta 4 |
 | **Porcentaje de Merma en Unidades** | `unidades_desechadas / (unidades_vendidas + unidades_desechadas)` | `mv_...unit_shrinkage_pct` |
 | **Incidentes de Merma no Autorizados** | `COUNT(*) WHERE authorized_by IS NULL` | `mv_...unauthorized_events` |
+| **Error de Pronóstico (WAPE)** | `SUM(\|pronóstico − real\|) / SUM(real)` sobre semanas no vistas al elegir el modelo | `ml.forecast_runs.holdout_wape` |
+| **Recall de la Compuerta de Calidad** | defectos inyectados detectados / defectos inyectados, fila por fila | `ops.v_dq_trend.gate_recall` |
 
 ### Por qué la "Exposición Financiera" es el disparador operativo
 
@@ -154,8 +161,12 @@ La Consulta 1 no reporta pérdidas pasadas (lo cual es labor contable posterior)
 | Producto vencido sigue disponible para venta en sistema | `sp_expire_overdue_batches` reclasifica lotes a `EXPIRED` y traslada el saldo a `waste_log` | `sql/04` |
 | Alteración de mermas para encubrir sustracciones | `trg_audit_high_waste_alert` bloquea bajas > S/ 50 sin un autorizador independiente | `sql/04` |
 | Facturación indebida de pedidos incompletos | Columna calculada `discrepancy_qty` y consulta de auditoría de recepciones | `sql/01`, `sql/03` |
-| Datos operativos inconsistentes distorsionan los KPIs | Pipeline ETL con 22 reglas de calidad; registros erróneos van a cuarentena | `src/etl_pipeline.py` |
+| Datos operativos inconsistentes distorsionan los KPIs | Pipeline ETL con 23 reglas de calidad clasificadas por dimensión; registros erróneos van a cuarentena | `src/etl_pipeline.py`, `src/dq.py` |
 | Lentitud en tableros por consultas complejas | Datamart materializado `mv_store_category_waste_summary` con refresco concurrente | `sql/04` |
+| Cada reporte calcula "ventas" o "merma" distinto | Esquema en estrella con carga incremental y 13 pruebas de modelo (conciliación contra el origen 3NF centavo a centavo e invariantes SCD2) | `sql/models/`, `src/model_runner.py` |
+| Un cambio de precio reescribe el margen histórico | Dimensión de producto SCD tipo 2: cada hecho se valora con la versión vigente el día de la venta | `sql/models/14_dim_product.sql` |
+| Nadie sabe qué lotes se van a vencer antes de que ocurra | Proyección FEFO hacia adelante contra el pronóstico: lista de remates con valor en riesgo | `src/forecasting.py`, `ml.projected_expiry` |
+| Una falla a media corrida deja el almacén a medias | Orquestador con dependencias: lo que depende de una tarea fallida se omite, y cada corrida queda registrada | `src/pipeline.py`, `ops.*` |
 
 ### El Control Antifraude en la Práctica
 
@@ -200,6 +211,64 @@ Las tasas de recuperación son SUPUESTOS fundamentados, presentados en tres esce
 
 *Costo total acumulado a 3 años: S/ 1,450,000 (Capex) + 3 × S/ 320,000 (Opex) = S/ 2,410,000.*
 
+### 6.4 Evidencia experimental sobre el supuesto de vencimiento recuperado
+
+Los escenarios de §6.3 suponen que una mejor reposición recupera entre 25% y 45% de la merma por
+vencimiento. Ese supuesto puede medirse en lugar de opinarse, y `src/policy_experiment.py` lo mide.
+
+**Diseño.** La red se simula bajo tres políticas de reposición: la **heurística actual** (nivel
+estático desde la demanda base del catálogo, ciega al patrón semanal), un **nivel plano** (misma
+lógica estadística pero con la media de 14 días, *sin* estacionalidad) y el **pronóstico estacional**
+(misma lógica con demanda por día de la semana). El nivel de servicio de cada política se elige en
+20 semillas de entrenamiento y se evalúa en **100 semillas distintas**; las diferencias se
+comparan por semilla con intervalos bootstrap del 95%. El nivel plano existe para aislar el valor
+del *pronóstico* del valor de simplemente *dimensionar mejor* los pedidos.
+
+| Política (EXPERIMENTO, media de 100 corridas de 60 días) | Utilidad neta | Merma total | del cual vencimiento | Ventas perdidas | Nivel de servicio |
+|---|---:|---:|---:|---:|---:|
+| Heurística actual | S/ 178,105 | S/ 2,343 | S/ 1,778 | S/ 3,729 | 99.2% |
+| Nivel plano (z = 2.05) | S/ 177,294 | S/ 1,508 | S/ 1,001 | S/ 7,774 | 98.4% |
+| **Pronóstico estacional (z = 2.5)** | **S/ 178,756** | **S/ 1,381** | **S/ 836** | S/ 4,874 | 99.0% |
+
+Utilidad neta = margen bruto − merma. Diferencias por corrida, IC 95% entre corchetes:
+
+| Comparación | Utilidad neta | Merma | Ventas perdidas |
+|---|---:|---:|---:|
+| Pronóstico vs. heurística | **+S/ 651** [+358, +952] | −S/ 962 [−1,028, −896] | +S/ 1,144 [+973, +1,314] |
+| Nivel plano vs. heurística | −S/ 811 [−1,110, −504] | −S/ 835 [−893, −774] | +S/ 4,044 [+3,831, +4,250] |
+| **Pronóstico vs. nivel plano** | **+S/ 1,462** [+1,209, +1,714] | −S/ 127 [−195, −58] | −S/ 2,900 [−3,099, −2,701] |
+
+**Lo que dicen los datos:**
+
+1. **La merma por vencimiento baja 53.0%, pero la utilidad neta sube solo 0.4%.** Del ahorro bruto de
+   merma (S/ 962 por corrida) sobrevive el **67.7%** como utilidad neta (S/ 651); el resto se pierde
+   en margen de ventas no realizadas por quiebre (S/ 311). Pedir menos siempre reduce la merma; lo
+   que no siempre ocurre es que valga la pena.
+2. **Bajar el stock sin estacionalidad pierde dinero** (−S/ 811 por corrida, significativo). Un
+   promedio plano subestima el fin de semana y sobreestima los días de semana a la vez.
+3. **El valor está en el pronóstico, no en la política más magra.** Pronóstico vs. nivel plano es
+   +S/ 1,462 por corrida, y es lo que vuelve rentable el pedido más ajustado.
+4. **Anualizado a 400 tiendas:** +S/ 651 por corrida de 4 tiendas equivale a S/ 990 por tienda por
+   año y a **≈ S/ 396 mil al año** (IC 95%: S/ 218 mil – S/ 579 mil). La estimación puntual queda
+   **entre el escenario conservador (S/ 332 mil) y el base (S/ 465 mil)** de §6.3, y el intervalo
+   incluye ambos. El supuesto de recuperación del 35% del escenario base es plausible, no probado.
+
+**Limitaciones que condicionan estas cifras:**
+
+- **La demanda simulada es fuertemente semanal por construcción.** Un pronóstico por día de la
+  semana está hecho para encontrar justo esa señal. El experimento mide el valor de capturar la
+  estacionalidad *cuando existe*, no el valor de pronosticar en una tienda real arbitraria.
+- **La heurística conoce la tasa base real** (la lee del catálogo), mientras que las políticas
+  aprendidas la infieren de ventas censuradas por quiebres. Eso favorece a la heurística.
+- **La utilidad neta omite costo de inventario y pérdida de clientes por quiebre.** Un quiebre cuesta
+  más que el margen perdido; considerarlo favorecería políticas con mayor nivel de servicio. La tabla
+  de frontera del informe permite reponderar ese equilibrio.
+- **Las dos primeras versiones del experimento estaban mal especificadas** y se documentan en el
+  informe: copiar la cobertura de `intervalo + 1` días de la heurística retenía dos días de stock
+  perecible, y *descartar* los días de quiebre sesgaba la demanda a la baja. Ambas correcciones se
+  decidieron tras corridas exploratorias en una sola semilla ajena a las 100 de evaluación y se
+  aplicaron antes de la evaluación final; aun así, quien lea esto debe saber que existieron.
+
 ---
 
 ## 7. Hoja de Ruta de Implementación (Roadmap)
@@ -210,7 +279,7 @@ Las tasas de recuperación son SUPUESTOS fundamentados, presentados en tres esce
 | **2. Piloto** | Semanas 5–12 | 4 tiendas piloto instrumentadas, reporte diario de exposición activo | Reducción de mermas por vencimiento ≥ 15% vs. histórico |
 | **3. Medición** | Semanas 13–16 | Tablero Power BI activo, auditoría de proveedores en mesas comerciales | Primera nota de crédito recuperada ante proveedores |
 | **4. Despliegue** | Meses 5–12 | Despliegue en 400 tiendas, barrido nocturno y reabastecimiento por DSI | Reducción global de intensidad de mermas ≥ 25% |
-| **5. Optimización** | Mes 12+ | Modelos predictivos de demanda sobre historial acumulado de ventas | Reducción de ventas perdidas por quiebre de stock ≥ 30% |
+| **5. Optimización** | Mes 12+ | Pronóstico de demanda (`src/forecasting.py`, ya implementado y validado en simulación) recalibrado sobre el historial real de ventas | WAPE ≤ 25% sobre datos reales y reducción de ventas perdidas por quiebre de stock ≥ 30% |
 
 ---
 
@@ -219,6 +288,8 @@ Las tasas de recuperación son SUPUESTOS fundamentados, presentados en tres esce
 Tres cuartas partes de las mermas monetarias corresponden al vencimiento de productos (MEDIDO), siendo la única categoría que una regla determinista de rotación FEFO puede mitigar estructuralmente. La plataforma implementa esta regla directamente en las transacciones de base de datos y provee trazabilidad total a través de auditorías analíticas y tableros ejecutivos.
 
 El escenario base proyecta un **beneficio anual de S/ 1.68 Millones frente a una inversión de S/ 1.45 Millones, recuperando la inversión en 12.8 meses con un ROI del 109% a tres años**.
+
+Esa proyección descansa en tasas de recuperación supuestas. La evidencia experimental de §6.4 las contrasta con una medición: la reposición guiada por pronóstico reduce la merma por vencimiento 53%, pero retiene solo dos tercios de ese ahorro como utilidad neta, y únicamente si el pronóstico captura la estacionalidad semanal. El beneficio neto medido de la palanca de reposición (≈ S/ 396 mil al año) queda entre los escenarios conservador y base, lo que respalda la plausibilidad del supuesto sin demostrarlo sobre datos reales.
 
 ---
 
