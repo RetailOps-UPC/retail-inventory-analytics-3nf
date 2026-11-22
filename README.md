@@ -1,7 +1,7 @@
 # Plataforma Analítica de Inventarios Retail y Control de Mermas — Arquitectura de Datos End-to-End
 
 > 🚀 **Dashboard Web Interactivo en Vivo:** [retail-inventory-web.vercel.app](https://retail-inventory-web.vercel.app/)  
-> 📁 **Repositorio del Frontend:** [`MrOdar/retail-inventory-web`](https://github.com/MrOdar/retail-inventory-web)
+> 📁 **Repositorio del Frontend:** [`RetailOps-UPC/retail-inventory-web`](https://github.com/RetailOps-UPC/retail-inventory-web)
 
 > ℹ️ **Aviso:** proyecto académico. El caso está inspirado en una cadena de tiendas de conveniencia peruana; todos los datos son sintéticos (generados por `src/data_generator.py`), sin afiliación ni relación con ninguna empresa real. Los nombres de sedes y marcas son ilustrativos.
 
