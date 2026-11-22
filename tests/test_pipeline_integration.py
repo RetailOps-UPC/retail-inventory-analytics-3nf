@@ -23,6 +23,23 @@ pytestmark = pytest.mark.integration
 SEED = 4242
 END = date(2026, 11, 14)
 
+# Demo transactions from sql/02_seed_data.sql are dated relative to CURRENT_DATE.
+# The pipeline here loads a synthetic network that ends on a fixed END, so those
+# rows would land days after it, depending on the day the suite runs, and skew the
+# star schema and the forecast (the calibration test failed a week after END).
+# Master data (stores, products, reasons, ...) stays; only the demo facts go.
+SEED_TRANSACTIONS = ("waste_log", "daily_sales", "inventory_batches",
+                     "goods_receipt_items", "goods_receipt_headers")
+
+
+@pytest.fixture
+def warehouse(warehouse):
+    from sqlalchemy import text
+    with warehouse.begin() as connection:
+        connection.execute(text("TRUNCATE " + ", ".join(SEED_TRANSACTIONS)
+                                + " RESTART IDENTITY CASCADE"))
+    return warehouse
+
 
 def make_ctx(warehouse, tmp_path):
     return pl.Context(
