@@ -144,7 +144,7 @@ El orden de inicio se asegura mediante los nombres de montaje en el contenedor:
 
 Los procedimientos y triggers se ejecutan deliberadamente **después** de los datos iniciales para asegurar que la vista materializada se cree con datos reales y no se evalúen triggers antes de tiempo.
 
-Servicio opcional de pgAdmin disponible bajo el perfil Compose `tools`.
+Servicio opcional de pgAdmin disponible bajo el perfil Compose `tools`. PostgreSQL (`5433`) y pgAdmin (`5050`) se publican solo en `127.0.0.1`: pgAdmin corre sin login y la base usa credenciales de ejemplo, así que no deben quedar accesibles desde la red local.
 
 El esquema estrella (`mart.*`) **no** se crea al iniciar el contenedor: lo construye `src/model_runner.py` cuando ya hay datos que modelar. El orquestador reaplica los esquemas `ops` y `ml` (idempotentes) en cada arranque, por lo que funciona también sobre un volumen creado antes de que esos archivos existieran.
 
