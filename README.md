@@ -79,7 +79,7 @@ El script de PowerShell expone las mismas acciones (`init-db`, `pipeline`, `gene
 
 | Parámetro | Valor |
 |---|---|
-| Host / Puerto | `localhost:5433` (puerto 5433 para evitar colisiones con PostgreSQL local) |
+| Host / Puerto | `localhost:5433` (puerto 5433 para evitar colisiones con PostgreSQL local; solo accesible desde tu equipo, publicado en `127.0.0.1`) |
 | Base de Datos | `retail_inventory_db` |
 | Usuario / Contraseña | `retail_admin` / `retail_secret` |
 | DSN | `postgresql+psycopg2://retail_admin:retail_secret@localhost:5433/retail_inventory_db` |

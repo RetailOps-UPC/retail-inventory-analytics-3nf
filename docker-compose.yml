@@ -46,7 +46,8 @@ services:
       PGTZ: America/Lima
     ports:
       # Host 5433 avoids colliding with a PostgreSQL already installed locally.
-      - "5433:5432"
+      # Bound to 127.0.0.1 so the database is not reachable from the local network.
+      - "127.0.0.1:5433:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
       # --- Ordered initialization scripts (first boot only) ---------------
@@ -78,7 +79,8 @@ services:
       PGADMIN_DEFAULT_PASSWORD: admin
       PGADMIN_CONFIG_SERVER_MODE: "False"
     ports:
-      - "5050:80"
+      # pgAdmin runs without login (SERVER_MODE False): only reachable from this machine.
+      - "127.0.0.1:5050:80"
     volumes:
       - pgadmin_data:/var/lib/pgadmin
     depends_on:
